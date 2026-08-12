@@ -8,6 +8,7 @@ from .config import SystemConfig
 from .market_metrics import ExpectedMoveCalculator, IVCrushRiskCalculator, atm_straddle_implied_move
 from .models import CalibrationStatus, CandidateInputs, DataHealth, InstrumentSpec, Moneyness, OptionType
 from .option_chain import OptionChainSnapshot
+from .risk import RequiredStopModel
 
 
 @dataclass(frozen=True)
@@ -31,6 +32,7 @@ class CandidateFactory:
         self.config = config
         self.expected = ExpectedMoveCalculator(config)
         self.ivrisk = IVCrushRiskCalculator(config)
+        self.required_stop = RequiredStopModel(config)
 
     def candidates_from_chain(self, chain: OptionChainSnapshot, option_expiry_date, lot_size: int, tick_size: float, ctx: CandidateFactoryContext) -> tuple[CandidateInputs, ...]:
         strikes = [s.strike for s in chain.strikes]
@@ -66,7 +68,7 @@ class CandidateFactory:
                     premium_elasticity=0.0,
                     expected_move=expected.expected_move,
                     required_move=expected.required_move,
-                    required_stop_points=expected.required_move,
+                    required_stop_points=self.required_stop.required_stop_points(leg.quote.mid),
                     expected_value_r=0.0,
                     vol_edge_ratio=expected.ratio,
                     convexity_edge_score=0.0,

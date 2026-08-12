@@ -21,6 +21,34 @@ class RiskContext:
     realized_loss_today: float = 0.0
 
 
+class RequiredStopModel:
+    """Logical stop distance required by structure/premium/volatility.
+
+    For a long-option day trade the invalidation level is driven primarily by
+    the premium paid: if the option loses a large fraction of its value, the
+    thesis is broken regardless of where the underlying sits. The model returns
+    a premium-based logical stop in points, floored by a configurable minimum
+    and capped by the hard-stop point cap so it can never exceed the risk-cap
+    derived stop. The DynamicRiskCalculator still enforces the survivability
+    rule: if this required stop does not fit inside the risk cap, the trade is
+    skipped.
+    """
+
+    def __init__(self, config: SystemConfig):
+        self.config = config
+
+    def required_stop_points(self, entry_premium: float) -> float:
+        raw = self.config.raw.get("required_stop_model")
+        if not isinstance(raw, dict):
+            return 0.0
+        if not raw.get("enabled", True):
+            return 0.0
+        pct = float(raw.get("premium_stop_pct", 0.20))
+        min_points = float(raw.get("min_points", 0.0))
+        stop = entry_premium * pct
+        return max(min_points, stop)
+
+
 class DynamicRiskCalculator:
     def __init__(self, config: SystemConfig):
         self.config = config

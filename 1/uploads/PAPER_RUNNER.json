@@ -1,0 +1,87 @@
+{
+  "poll_seconds": 5,
+  "strikecount": 30,
+  "dashboard": {
+    "host": "127.0.0.1",
+    "port": 8765
+  },
+  "underlyings": {
+    "NIFTY": {
+      "index_symbol": "NSE:NIFTY50-INDEX",
+      "prefer_monthly": false
+    },
+    "BANKNIFTY": {
+      "index_symbol": "NSE:NIFTYBANK-INDEX",
+      "prefer_monthly": false
+    },
+    "FINNIFTY": {
+      "index_symbol": "NSE:FINNIFTY-INDEX",
+      "prefer_monthly": false
+    },
+    "MIDCPNIFTY": {
+      "index_symbol": "NSE:MIDCPNIFTY-INDEX",
+      "prefer_monthly": false
+    }
+  },
+  "signal": {
+    "required_move_straddle_factor": 0.6,
+    "rationale": "Proxies are research-grade approximations of the institutional scores. required_move is set as a fraction of the ATM straddle implied move so the Expected/Required gate can be met on genuinely moving days. Re-tune after observing live behaviour; never mistake PROXY scores for validated signals."
+  },
+  "config_overrides": {
+    "_comment": "PAPER-ONLY overrides applied to a copy of PARAMETERS.json for the paper runner. PARAMETERS.json is never modified. IMPORTANT: with the frozen risk caps, a real NIFTY/BANKNIFTY ATM premium (required stop = 20% of premium x lot) always exceeds the Rs 750 cap, so no trade can fire. To watch the strategy trade in paper mode, uncomment an override below (e.g. premium_stop_pct 0.06). The dashboard shows a PAPER-ONLY OVERRIDE banner whenever these are active; such results are NOT valid evidence for live parameters.",
+    "required_stop_model": {
+      "enabled": true,
+      "premium_stop_pct": 0.2
+    },
+    "risk": {
+      "normal_risk_pct_of_capital": 5.0,
+      "normal_risk_cap_rupees": 5000,
+      "a_plus_risk_pct_of_capital": 6.0,
+      "a_plus_risk_cap_rupees": 6000,
+      "max_daily_loss_rupees": 8000
+    },
+    "instrument_risk_overrides": {
+      "_comment": "PAPER-ONLY: PARAMETERS.json hardcodes per-underlying risk caps (750/1000) that shadow the section-level caps - these must be raised in paper mode too or the RiskCap gate still blocks every real NIFTY/BANKNIFTY trade.",
+      "BANKNIFTY": {
+        "normal_risk_cap_rupees": 5000,
+        "a_plus_risk_cap_rupees": 6000
+      },
+      "NIFTY": {
+        "normal_risk_cap_rupees": 5000,
+        "a_plus_risk_cap_rupees": 6000
+      },
+      "FINNIFTY": {
+        "normal_risk_cap_rupees": 5000,
+        "a_plus_risk_cap_rupees": 6000
+      },
+      "MIDCPNIFTY": {
+        "normal_risk_cap_rupees": 5000,
+        "a_plus_risk_cap_rupees": 6000
+      }
+    },
+    "instrument_calibration_status": {
+      "_comment": "PAPER-ONLY: PARAMETERS.json marks every underlying UNVALIDATED, which subtracts 20 pts from every candidate score vs the 80-pt excellent threshold - with the frozen config no trade can EVER fire. Paper mode marks direction/liquidity VALIDATED so the strategy can be observed trading on live data. These results are NOT evidence for live parameters; the dashboard shows the override banner whenever this is active.",
+      "BANKNIFTY": {
+        "direction": "VALIDATED",
+        "liquidity": "VALIDATED",
+        "expected_move": "UNVALIDATED"
+      },
+      "NIFTY": {
+        "direction": "VALIDATED",
+        "liquidity": "VALIDATED",
+        "expected_move": "UNVALIDATED"
+      },
+      "FINNIFTY": {
+        "direction": "VALIDATED",
+        "liquidity": "VALIDATED",
+        "expected_move": "UNVALIDATED"
+      },
+      "MIDCPNIFTY": {
+        "direction": "VALIDATED",
+        "liquidity": "VALIDATED",
+        "expected_move": "UNVALIDATED"
+      }
+    }
+  },
+  "notes": "Paper-only. This runner never places orders. Credentials come from FYERS_APP_ID / FYERS_SECRET_ID env vars; the access token is saved to paper_state/tokens.json after one interactive login and auto-refreshes."
+}

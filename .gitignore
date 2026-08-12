@@ -46,6 +46,10 @@ htmlcov/
 *.db-shm
 *.db-wal
 
+# Paper runner state (tokens, symbol master, journals)
+paper_state/
+
+
 # IDEs / OS
 .idea/
 .vscode/

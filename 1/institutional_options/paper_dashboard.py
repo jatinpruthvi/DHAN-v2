@@ -1,0 +1,264 @@
+"""Dependency-free live dashboard for the paper trading runner.
+
+Serves two endpoints from a ThreadingHTTPServer:
+
+    /            self-contained HTML page (inline CSS/JS, no CDN)
+    /state.json  current JSON snapshot from the runner
+
+The page auto-refreshes every few seconds and renders: live chains with
+bid/ask per strike, candidate ranking with grades/scores/reasons, the open
+position with unrealized P&L and exit-policy state, closed trade history,
+realized P&L, and an equity curve (inline SVG). All rendering is vanilla JS.
+"""
+from __future__ import annotations
+
+import json
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Callable
+
+PAGE = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Paper Trading Dashboard</title>
+<style>
+  :root { --bg:#0f1419; --panel:#1a222b; --border:#2a3542; --text:#dbe4ee; --muted:#8fa1b3;
+          --green:#3ecf8e; --red:#f4686a; --amber:#f2c14e; --blue:#58a6ff; }
+  * { box-sizing:border-box; }
+  body { background:var(--bg); color:var(--text); font:14px/1.45 -apple-system, "Segoe UI", Roboto, sans-serif; margin:0; padding:16px; }
+  h1 { font-size:20px; margin:0 0 4px; }
+  h2 { font-size:15px; margin:18px 0 8px; border-bottom:1px solid var(--border); padding-bottom:6px; }
+  .sub { color:var(--muted); font-size:12px; margin-bottom:12px; }
+  .cards { display:flex; flex-wrap:wrap; gap:10px; margin-bottom:6px; }
+  .card { background:var(--panel); border:1px solid var(--border); border-radius:8px; padding:10px 14px; min-width:150px; }
+  .card .k { color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.04em; }
+  .card .v { font-size:18px; font-weight:600; margin-top:2px; }
+  .pos { color:var(--green); } .neg { color:var(--red); }
+  table { border-collapse:collapse; width:100%; font-size:12px; background:var(--panel); border-radius:8px; overflow:hidden; }
+  th, td { padding:5px 8px; border-bottom:1px solid var(--border); text-align:right; white-space:nowrap; }
+  th { background:#212b36; color:var(--muted); font-weight:600; }
+  td:first-child, th:first-child { text-align:left; }
+  tr:hover td { background:#202a35; }
+  .open { background:#13231d !important; } .open:hover td { background:#163129 !important; }
+  .badge { display:inline-block; padding:1px 7px; border-radius:10px; font-size:11px; font-weight:600; }
+  .b-A { background:#143d2a; color:var(--green); } .b-B { background:#3d3314; color:var(--amber); }
+  .b-C { background:#3d1f14; color:var(--amber); } .b-Reject { background:#3d1414; color:var(--red); }
+  .reasons { color:var(--muted); font-size:11px; max-width:320px; white-space:normal; }
+  .pill { display:inline-block; background:#212b36; border:1px solid var(--border); border-radius:12px; padding:2px 10px; margin:2px 4px 2px 0; font-size:12px; }
+  .note { color:var(--muted); font-size:11px; margin-top:14px; }
+  .err { color:var(--red); }
+  .muted { color:var(--muted); }
+  #equity svg { background:var(--panel); border:1px solid var(--border); border-radius:8px; width:100%; height:140px; }
+  .chain-grid { display:flex; flex-wrap:wrap; gap:10px; }
+  .chain-panel { background:var(--panel); border:1px solid var(--border); border-radius:8px; padding:8px; min-width:300px; flex:1; }
+  .chain-panel h3 { margin:0 0 6px; font-size:13px; }
+  .strike-row { display:grid; grid-template-columns:1fr 1fr 40px 1fr 1fr; gap:4px; font-size:11px; padding:2px 0; border-bottom:1px solid #1d2733; }
+  .strike-row.head { color:var(--muted); font-size:10px; }
+</style>
+</head>
+<body>
+  <h1>Paper Trading Dashboard</h1>
+  <div class="sub" id="sub">connecting…</div>
+  <div id="override" class="err" style="display:none;background:#3d1414;border:1px solid var(--red);border-radius:8px;padding:8px 12px;margin-bottom:10px;font-weight:600">⚠ PAPER-ONLY CONFIG OVERRIDES ACTIVE — these do NOT affect uploads/PARAMETERS.json. Do not treat these results as live-parameter evidence.</div>
+  <div class="cards">
+    <div class="card"><div class="k">Mode</div><div class="v" id="mode">—</div></div>
+    <div class="card"><div class="k">Market</div><div class="v" id="market">—</div></div>
+    <div class="card"><div class="k">Capital</div><div class="v" id="capital">—</div></div>
+    <div class="card"><div class="k">Realized P&amp;L</div><div class="v" id="pnl">—</div></div>
+    <div class="card"><div class="k">Trades</div><div class="v" id="trades">—</div></div>
+    <div class="card"><div class="k">Win rate</div><div class="v" id="winrate">—</div></div>
+    <div class="card"><div class="k">Net P&amp;L avg</div><div class="v" id="avgpnl">—</div></div>
+  </div>
+  <div id="err" class="err"></div>
+
+  <h2>Open Position</h2>
+  <div id="open">no open position</div>
+
+  <h2>Candidates</h2>
+  <div id="cands">waiting for cycle…</div>
+
+  <h2>Live Chains</h2>
+  <div class="chain-grid" id="chains"></div>
+
+  <h2>Equity Curve (realized P&amp;L)</h2>
+  <div id="equity"></div>
+
+  <h2>Closed Trades</h2>
+  <div id="closed">no closed trades yet</div>
+
+  <div class="note" id="note"></div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const fmt = (v, d=2) => v == null ? '—' : Number(v).toLocaleString('en-IN', {maximumFractionDigits: d, minimumFractionDigits: d});
+const cls = (v) => (v > 0 ? 'pos' : (v < 0 ? 'neg' : ''));
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+function render(st) {
+  $('sub').textContent = `started ${st.started_at} · session ${st.session_id} · last cycle ${st.last_cycle} · ${st.note}`;
+  $('mode').textContent = st.mode;
+  $('market').textContent = st.market_open ? 'OPEN' : 'CLOSED';
+  $('capital').textContent = '₹' + fmt(st.capital, 0);
+  $('pnl').textContent = '₹' + fmt(st.realized_pnl, 0);
+  $('pnl').className = cls(st.realized_pnl);
+  const trades = st.closed_trades || [];
+  const wins = trades.filter(t => t.net_pnl > 0).length;
+  $('trades').textContent = trades.length;
+  $('winrate').textContent = trades.length ? (100*wins/trades.length).toFixed(0) + '%' : '—';
+  $('avgpnl').textContent = trades.length ? '₹' + fmt(trades.reduce((a,t)=>a+t.net_pnl,0)/trades.length, 0) : '—';
+  $('err').textContent = st.last_cycle_ok ? '' : ('Last cycle error: ' + (st.last_error || 'unknown'));
+  const ov = $('override');
+  if (st.paper_overrides_active) {
+    ov.style.display = 'block';
+    ov.textContent = '⚠ PAPER-ONLY CONFIG OVERRIDES ACTIVE: ' + JSON.stringify(st.active_overrides) + ' — uploads/PARAMETERS.json is NOT modified. Not valid evidence for live parameters.';
+  } else {
+    ov.style.display = 'none';
+  }
+  renderOpen(st.open_position);
+  renderCands((st.underlyings && st.underlyings._candidates) || []);
+  renderChains(st.underlyings || {});
+  renderEquity(st.equity || []);
+  renderClosed(trades);
+}
+
+function renderOpen(p) {
+  const el = $('open');
+  if (!p) { el.textContent = 'no open position'; return; }
+  const u = p.last - p.entry;
+  const pol = p.exit_policy || {};
+  const bits = [
+    `${p.side} ${fmt(p.strike,0)} @ ${fmt(p.entry)}`,
+    `last ${fmt(p.last)}`,
+    `uPnL <span class="${cls(u)}">₹${fmt(u * (p.entry?0:0) || p.unrealized_pnl, 0)}</span> (${fmt(p.unrealized_points,1)} pts)`,
+    `stop ${fmt(p.stop_points,1)} pts · target ${fmt(p.target_points,1)} pts`,
+    `elapsed ${p.elapsed_sec}s / ${p.max_duration_sec}s`,
+    `MFE ${fmt(p.mfe_points,1)} · MAE ${fmt(p.mae_points,1)} · bars ${p.bars}`,
+    `policy: be@${pol.breakeven_trigger_r}R trail@${pol.trail_trigger_r}R/${pol.trail_distance_r}R lossCut@${pol.losing_time_stop_fraction}`,
+  ];
+  el.innerHTML = '<div class="card open" style="min-width:100%"><div class="v" style="font-size:14px">' + bits.map(b=>`<span class="pill">${b}</span>`).join('') + '</div></div>';
+}
+
+function renderCands(rows) {
+  const el = $('cands');
+  if (!rows.length) { el.textContent = 'no candidates evaluated yet'; return; }
+  const head = ['underlying','side','strike','expiry','grade','score','threshold','eligible','decision','CQ','elas','conv','exec','conf','regime','dir','bid/ask','reasons'];
+  let h = '<table><tr>' + head.map(c=>`<th>${c}</th>`).join('') + '</tr>';
+  for (const r of rows) {
+    const gradeCls = 'b-' + r.grade.replace('+','').trim();
+    h += `<tr><td>${esc(r.underlying)}</td><td>${esc(r.side)}</td><td>${fmt(r.strike,0)}</td><td>${esc(r.expiry)}</td>` +
+      `<td><span class="badge ${gradeCls}">${esc(r.grade)}</span></td>` +
+      `<td>${fmt(r.score,1)}</td><td>${fmt(r.threshold,1)}</td><td>${r.eligible?'✓':'✗'}</td><td>${esc(r.decision)}</td>` +
+      `<td>${fmt(r.contract_quality,1)}</td><td>${fmt(r.premium_elasticity,2)}</td><td>${fmt(r.convexity,1)}</td>` +
+      `<td>${fmt(r.execution,1)}</td><td>${fmt(r.confidence,1)}</td><td>${fmt(r.regime_fit,1)}</td><td>${fmt(r.direction,1)}</td>` +
+      `<td>${fmt(r.bid,1)}/${fmt(r.ask,1)}</td><td class="reasons">${esc(r.reasons)}</td></tr>`;
+  }
+  el.innerHTML = h + '</table>';
+}
+
+function renderChains(uds) {
+  const el = $('chains');
+  el.innerHTML = '';
+  for (const [und, d] of Object.entries(uds)) {
+    if (und.startsWith('_')) continue;
+    if (d.error) { el.innerHTML += `<div class="chain-panel"><h3>${esc(und)}</h3><span class="err">${esc(d.error)}</span></div>`; continue; }
+    let rows = `<div class="strike-row head"><span>Strike</span><span>CE bid/ask</span><span></span><span>PE bid/ask</span><span>spot ${fmt(d.spot,1)}</span></div>`;
+    for (const s of (d.strikes || [])) {
+      const ce = s.ce ? fmt(s.ce.bid,1)+' / '+fmt(s.ce.ask,1) : '—';
+      const pe = s.pe ? fmt(s.pe.bid,1)+' / '+fmt(s.pe.ask,1) : '—';
+      const marker = s.atm ? '◄' : '';
+      rows += `<div class="strike-row"><span>${fmt(s.strike,0)} ${marker}</span><span>${ce}</span><span></span><span>${pe}</span><span></span></div>`;
+    }
+    const meta = `VIX ${d.vix!=null?fmt(d.vix,1):'—'} · exp ${esc(d.expiry)} · dte ${fmt(d.dte,1)} · dir ${fmt(d.direction,0)} · TQ ${fmt(d.trade_quality,0)} · host ${fmt(d.hostility,0)} · reqMove ${fmt(d.required_move,0)} · ATR1 ${fmt(d.atr1,2)} · eff ${fmt(d.trend_eff,0)}`;
+    el.innerHTML += `<div class="chain-panel"><h3>${esc(und)}</h3><div class="muted" style="font-size:11px;margin-bottom:6px">${meta}</div>${rows}</div>`;
+  }
+}
+
+function renderEquity(equity) {
+  const el = $('equity');
+  if (!equity.length) { el.innerHTML = '<span class="muted">no equity data yet</span>'; return; }
+  const w = 900, h = 140, pad = 8;
+  const min = Math.min(...equity), max = Math.max(...equity), span = (max-min) || 1;
+  const pts = equity.map((v,i) => [pad + i*(w-2*pad)/(equity.length-1||1), h-pad - (v-min)/span*(h-2*pad)]);
+  const line = pts.map(p=>p.join(',')).join(' ');
+  const last = equity[equity.length-1];
+  el.innerHTML = `<svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="none"><polyline points="${line}" fill="none" stroke="${last>=0?'#3ecf8e':'#f4686a'}" stroke-width="1.6"/></svg>` +
+    `<div class="muted">last realized P&amp;L ₹${fmt(last,0)} · peak ₹${fmt(max,0)} · trough ₹${fmt(min,0)}</div>`;
+}
+
+function renderClosed(trades) {
+  const el = $('closed');
+  if (!trades.length) { el.textContent = 'no closed trades yet'; return; }
+  const rev = [...trades].reverse();
+  const head = ['#','underlying','side','strike','entry','exit','reason','gross pts','net ₹','hold'];
+  let h = '<table><tr>' + head.map(c=>`<th>${c}</th>`).join('') + '</tr>';
+  rev.forEach((t,i) => {
+    h += `<tr><td>${trades.length-i}</td><td>${esc(t.underlying)}</td><td>${esc(t.side)}</td><td>${fmt(t.strike,0)}</td>` +
+      `<td>${fmt(t.entry_fill)}</td><td>${fmt(t.exit_fill)}</td><td>${esc(t.exit_reason)}</td>` +
+      `<td class="${cls(t.gross_points)}">${fmt(t.gross_points,1)}</td><td class="${cls(t.net_pnl)}">₹${fmt(t.net_pnl,0)}</td>` +
+      `<td>${fmt(t.hold_seconds,0)}s</td></tr>`;
+  });
+  el.innerHTML = h + '</table>';
+}
+
+async function tick() {
+  try {
+    const r = await fetch('state.json');
+    render(await r.json());
+  } catch (e) {
+    $('err').textContent = 'state fetch failed: ' + e;
+  }
+}
+tick();
+setInterval(tick, 3000);
+</script>
+</body>
+</html>
+"""
+
+
+class DashboardHandler(BaseHTTPRequestHandler):
+    snapshot_fn: Callable[[], dict] = lambda: {}
+
+    def do_GET(self):  # noqa: N802 (stdlib naming)
+        if self.path.startswith("/state.json"):
+            body = json.dumps(self.snapshot_fn()).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        body = PAGE.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, fmt, *args):  # keep the loop output clean
+        return
+
+
+class PaperDashboard:
+    def __init__(self, snapshot_fn: Callable[[], dict], host: str = "127.0.0.1", port: int = 8765):
+        self.snapshot_fn = snapshot_fn
+        self.host = host
+        self.port = port
+        self._server: Optional[ThreadingHTTPServer] = None
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self) -> str:
+        handler = type("Handler", (DashboardHandler,), {"snapshot_fn": self.snapshot_fn})
+        self._server = ThreadingHTTPServer((self.host, self.port), handler)
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread.start()
+        return f"http://{self.host}:{self.port}"
+
+    def stop(self) -> None:
+        if self._server is not None:
+            self._server.shutdown()
+            self._server.server_close()

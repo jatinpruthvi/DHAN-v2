@@ -187,6 +187,21 @@
     "risk_cap_is_ceiling_not_target": true,
     "skip_if_required_stop_exceeds_max_allowed_risk": true
   },
+  "exit_management": {
+    "enabled": true,
+    "breakeven_trigger_r": 1.0,
+    "trail_trigger_r": 2.0,
+    "trail_distance_r": 1.0,
+    "losing_time_stop_fraction": 0.35,
+    "time_decay_tighten": 0.0,
+    "rationale": "Ratchet never loosens the stop, so worst-case risk per trade is unchanged. Breakeven at 1.0R banks winners (roi_lab 10-seed ensemble: +15.9pp ROI, -20.6R maxDD vs legacy). Losing_time_stop_fraction=0.35 exits a still-losing trade after 35% of the holding window, so losers do not consume the full window: ensemble +22.6pp ROI and -62.5R maxDD over breakeven-only. Trail trigger at 2.0R (default target) keeps the trail latent; lower it to catch give-backs when reversal frequency is high. time_decay_tighten (0..1) tightens the stop toward entry near the deadline; kept at 0.0 because it trades ROI for extra drawdown reduction."
+  },
+  "required_stop_model": {
+    "enabled": true,
+    "premium_stop_pct": 0.2,
+    "min_points": 0.0,
+    "rationale": "Logical invalidation stop as a fraction of premium paid. The DynamicRiskCalculator still skips the trade if this stop does not fit the risk cap; risk caps are never widened."
+  },
   "holding_time": {
     "no_trade_before": "09:30",
     "normal_average_min": 15,
