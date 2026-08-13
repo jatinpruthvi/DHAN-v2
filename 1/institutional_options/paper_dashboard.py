@@ -135,7 +135,7 @@ function renderOpen(p) {
     `stop ${fmt(p.stop_points,1)} pts · target ${fmt(p.target_points,1)} pts`,
     `elapsed ${p.elapsed_sec}s / ${p.max_duration_sec}s`,
     `MFE ${fmt(p.mfe_points,1)} · MAE ${fmt(p.mae_points,1)} · bars ${p.bars}`,
-    `policy: be@${pol.breakeven_trigger_r}R trail@${pol.trail_trigger_r}R/${pol.trail_distance_r}R lossCut@${pol.losing_time_stop_fraction}`,
+    `policy: be@${pol.breakeven_trigger_r}R trail@${pol.trail_trigger_r}R/${pol.trail_distance_r}R lossCut@${pol.losing_time_stop_fraction} vts@${pol.vol_time_stop_fraction||0} slip@${pol.stop_exit_slippage_frac||0}`,
   ];
   el.innerHTML = '<div class="card open" style="min-width:100%"><div class="v" style="font-size:14px">' + bits.map(b=>`<span class="pill">${b}</span>`).join('') + '</div></div>';
 }

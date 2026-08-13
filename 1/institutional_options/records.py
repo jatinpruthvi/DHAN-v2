@@ -109,6 +109,8 @@ class MTILRecordBuilder:
             "elasticity_strength": "UNVALIDATED",
             "entry_spread_points": c.quote.spread,
             "entry_spread_pct": c.quote.spread / c.quote.mid * 100 if c.quote.mid else "",
+            "entry_spread_cost_points": (trade.entry_fill.fill_price - c.quote.mid) if trade.entry_fill.fill_price is not None else "",
+            "entry_spread_cost_rupees": ((trade.entry_fill.fill_price - c.quote.mid) * c.instrument.lot_size) if trade.entry_fill.fill_price is not None else "",
             "bid_qty_lots": c.quote.bid_qty / c.instrument.lot_size,
             "ask_qty_lots": c.quote.ask_qty / c.instrument.lot_size,
             "top_book_coverage": min(c.quote.bid_qty, c.quote.ask_qty) / c.instrument.lot_size,

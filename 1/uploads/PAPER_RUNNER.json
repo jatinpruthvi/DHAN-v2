@@ -1,6 +1,7 @@
 {
   "poll_seconds": 5,
   "strikecount": 30,
+  "capture": true,
   "dashboard": {
     "host": "127.0.0.1",
     "port": 8765
@@ -32,6 +33,15 @@
     "required_stop_model": {
       "enabled": true,
       "premium_stop_pct": 0.2
+    },
+    "exit_management": {
+      "_comment": "PAPER-ONLY exit-management tuning: vol_time_stop_fraction exits dead trades once 35% of the holding window has passed and the remaining expected move can no longer reach the target; stop_exit_slippage_frac models gap-through-stop on risk-reducing exits (10% of 1R) so paper drawdown is an honest upper bound; edge_scaled_target gives high expected/required setups more room (up to 3R) and banks marginal ones earlier. None of these loosen the stop, so worst-case per-trade risk is unchanged. All paper-only.",
+      "vol_time_stop_fraction": 0.35,
+      "stop_exit_slippage_frac": 0.1,
+      "edge_scaled_target": true,
+      "edge_scale_min_ratio": 1.1,
+      "edge_scale_min_r": 1.0,
+      "edge_scale_max_r": 3.0
     },
     "risk": {
       "normal_risk_pct_of_capital": 5.0,

@@ -15,6 +15,11 @@ class MarketBar:
     quote: Quote
     futures_price: float
     iv: Optional[float] = None
+    # Remaining expected move of the underlying in premium points at this bar
+    # (e.g. the regime-projected move for the rest of the session). Used by the
+    # volatility-aware time stop to decide when a trade can no longer reach its
+    # target. None disables that check for this bar.
+    expected_move_remaining: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -39,6 +44,17 @@ class ExitPolicy:
     # stop distance shrinks from 1R to (1 - time_decay_tighten)*1R by the
     # deadline. 0.0 disables.
     time_decay_tighten: float = 0.0
+    # Volatility-aware time stop: once this fraction of the max-holding window
+    # has elapsed, exit if the remaining expected move (bar.expected_move_remaining)
+    # is smaller than the distance still needed to reach the target. This is a
+    # smarter version of the losing_time_stop: it exits "dead" trades based on
+    # whether the remaining move can plausibly pay out. 0.0 disables.
+    vol_time_stop_fraction: float = 0.0
+    # Extra slippage applied to risk-reducing exits (stop/breakeven/trail/time/
+    # losing-time/vol-time), expressed as a fraction of the initial stop distance
+    # (1R). Models gap-through-stop: paper drawdown should be an honest upper
+    # bound for live. 0.0 disables (current behaviour).
+    stop_exit_slippage_frac: float = 0.0
 
     @classmethod
     def from_config(cls, config: Optional[SystemConfig]) -> "ExitPolicy":
@@ -54,6 +70,8 @@ class ExitPolicy:
             trail_distance_r=float(raw.get("trail_distance_r", 1.0)),
             losing_time_stop_fraction=float(raw.get("losing_time_stop_fraction", 0.0)),
             time_decay_tighten=float(raw.get("time_decay_tighten", 0.0)),
+            vol_time_stop_fraction=float(raw.get("vol_time_stop_fraction", 0.0)),
+            stop_exit_slippage_frac=float(raw.get("stop_exit_slippage_frac", 0.0)),
         )
 
 
@@ -64,6 +82,7 @@ EXIT_BREAKEVEN = "BREAKEVEN_HIT"
 EXIT_TRAIL = "TRAIL_HIT"
 EXIT_TIME = "TIME_STOP"
 EXIT_LOSING_TIME = "LOSING_TIME_STOP"
+EXIT_VOL_TIME = "VOL_TIME_STOP"
 EXIT_END_OF_DATA = "END_OF_DATA_EXIT"
 EXIT_NO_DATA = "NO_EXIT_DATA"
 
@@ -181,6 +200,10 @@ class SimulatedTradeLifecycle:
         last_quote: Optional[Quote] = None
         last_time: Optional[datetime] = None
         tick = trade.entry_evaluation.candidate.instrument.tick_size
+        # Gap/slippage buffer on risk-reducing exits (never on targets): models
+        # that a real marketable exit during a fast move fills worse than the
+        # observed quote. 0 by default -> legacy behaviour.
+        exit_buffer = r * max(0.0, policy.stop_exit_slippage_frac)
         for bar in bars:
             last_quote = bar.quote
             last_time = bar.timestamp
@@ -208,7 +231,7 @@ class SimulatedTradeLifecycle:
                 exit_reason = EXIT_TARGET
                 break
             if premium <= stop_level:
-                exit_fill = self.fill_simulator.exit_sell(bar.quote, tick)
+                exit_fill = self.fill_simulator.exit_sell(bar.quote, tick, slippage_baseline=exit_buffer)
                 exit_time = bar.timestamp
                 if entry - 1e-9 <= stop_level <= entry + 1e-9:
                     exit_reason = EXIT_BREAKEVEN
@@ -225,12 +248,24 @@ class SimulatedTradeLifecycle:
             if policy.losing_time_stop_fraction > 0:
                 elapsed_frac = min(1.0, max(0.0, (bar.timestamp - trade.entry_time).total_seconds() / max_duration_seconds)) if max_duration_seconds > 0 else 1.0
                 if elapsed_frac >= policy.losing_time_stop_fraction and premium < entry:
-                    exit_fill = self.fill_simulator.exit_sell(bar.quote, tick)
+                    exit_fill = self.fill_simulator.exit_sell(bar.quote, tick, slippage_baseline=exit_buffer)
                     exit_time = bar.timestamp
                     exit_reason = EXIT_LOSING_TIME
                     break
+            # Volatility-aware time stop: once past the fraction threshold, exit
+            # if the remaining expected move can no longer reach the target.
+            # Only fires when the runner supplies expected_move_remaining.
+            if policy.vol_time_stop_fraction > 0 and bar.expected_move_remaining is not None and bar.expected_move_remaining >= 0:
+                elapsed_frac = min(1.0, max(0.0, (bar.timestamp - trade.entry_time).total_seconds() / max_duration_seconds)) if max_duration_seconds > 0 else 1.0
+                if elapsed_frac >= policy.vol_time_stop_fraction:
+                    dist_to_target = (entry + target_points) - premium
+                    if dist_to_target > bar.expected_move_remaining + 1e-9:
+                        exit_fill = self.fill_simulator.exit_sell(bar.quote, tick, slippage_baseline=exit_buffer)
+                        exit_time = bar.timestamp
+                        exit_reason = EXIT_VOL_TIME
+                        break
             if bar.timestamp >= deadline:
-                exit_fill = self.fill_simulator.exit_sell(bar.quote, tick)
+                exit_fill = self.fill_simulator.exit_sell(bar.quote, tick, slippage_baseline=exit_buffer)
                 exit_time = bar.timestamp
                 exit_reason = EXIT_TIME
                 break

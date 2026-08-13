@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import math
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta
 from statistics import mean
 from typing import Optional
@@ -56,6 +56,10 @@ class LabScenario:
     spread_frac: float = 0.005
     stop_points: float = 20.0     # 1R
     target_points: float = 40.0   # 2R
+    # Per-bar expected move (premium points) supplied on bars so the
+    # volatility-aware time stop (ExitPolicy.vol_time_stop_fraction) can fire.
+    # 0.0 disables (bars carry no expected move).
+    expected_move_per_bar: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -163,7 +167,10 @@ def simulate_trades(paths: list[list[float]], cfg: SystemConfig, policy: Optiona
         bars = []
         for i, premium in enumerate(path):
             ts = template.entry_time + timedelta(seconds=5 * i)
-            bars.append(MarketBar(ts, _quote_at(premium, spread, ts), 25000.0))
+            remaining = (scenario.expected_move_per_bar * max(0.0, scenario.bars - i)
+                         if scenario.expected_move_per_bar > 0 else None)
+            bars.append(MarketBar(ts, _quote_at(premium, spread, ts), 25000.0,
+                                  expected_move_remaining=remaining))
         fill = PaperFillSimulator(cfg).entry_buy(entry_quote, tick)
         if not fill.filled or fill.fill_price is None:
             unfilled += 1
@@ -211,6 +218,21 @@ def run_experiment(scenario: Optional[LabScenario] = None, cfg_path: str = "uplo
     return legacy, managed
 
 
+def run_vol_time_experiment(scenario: Optional[LabScenario] = None,
+                            cfg_path: str = "uploads/PARAMETERS.json",
+                            vol_time_fraction: float = 0.35,
+                            expected_move_per_bar: float = 2.0) -> tuple[LabMetrics, LabMetrics]:
+    """Compare the configured exit policy against the same policy plus the
+    volatility-aware time stop (bars carry a decaying expected move)."""
+    scenario = scenario or LabScenario(expected_move_per_bar=expected_move_per_bar)
+    cfg = SystemConfig.from_file(cfg_path)
+    paths = generate_paths(scenario)
+    managed = simulate_trades(paths, cfg, ExitPolicy.from_config(cfg), scenario)
+    vts_policy = replace(ExitPolicy.from_config(cfg), vol_time_stop_fraction=vol_time_fraction)
+    vts = simulate_trades(paths, cfg, vts_policy, scenario)
+    return managed, vts
+
+
 def main() -> int:
     legacy, managed = run_experiment()
     print(legacy.table_row())
@@ -221,6 +243,17 @@ def main() -> int:
     print(f"Delta maxDraw : {delta_dd:+.2f} R   (<= 0 means drawdown did not worsen)")
     ok = delta_roi > 0 and delta_dd <= 1e-9
     print("Verdict       : " + ("PASS — ROI improved without increasing drawdown" if ok else "FAIL"))
+    if ok:
+        managed2, vts = run_vol_time_experiment()
+        print("\n-- volatility-aware time stop vs configured policy --")
+        print(managed2.table_row())
+        print(vts.table_row())
+        delta_vts = vts.roi_pct - managed2.roi_pct
+        delta_vts_dd = vts.max_drawdown_r - managed2.max_drawdown_r
+        print(f"Delta ROI      : {delta_vts:+.2f} pp")
+        print(f"Delta maxDraw  : {delta_vts_dd:+.2f} R")
+        if vts.exits.get("VOL_TIME_STOP", 0) > 0:
+            print("VTS fired      : yes — dead trades exited before the deadline")
     return 0 if ok else 1
 
 

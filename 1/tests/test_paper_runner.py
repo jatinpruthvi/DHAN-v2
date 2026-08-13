@@ -1,9 +1,11 @@
+import csv
 import json
 import tempfile
 import time
 import unittest
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 from institutional_options.config import SystemConfig
@@ -212,6 +214,57 @@ class RunnerCycleTests(unittest.TestCase):
         json.dumps(snap)  # must not raise
         self.assertEqual(snap["mode"], "PAPER (no orders placed)")
         self.assertIn("equity", snap)
+
+    def test_edge_scaled_target_scales_with_ratio(self):
+        edge_cfg = {**RUNNER_CFG, "config_overrides": {"exit_management": {
+            "edge_scaled_target": True, "edge_scale_min_ratio": 1.1,
+            "edge_scale_min_r": 1.0, "edge_scale_max_r": 3.0}}}
+        runner = PaperRunner(self.cfg, edge_cfg, state_dir=self.state_dir,
+                             client=FakeClient(history=history_rising()),
+                             master=make_master())
+        strong = SimpleNamespace(candidate=SimpleNamespace(expected_move=176.0, required_move=100.0))
+        self.assertAlmostEqual(runner._target_r(strong), 3.0)  # 2.0*1.6 capped
+        weak = SimpleNamespace(candidate=SimpleNamespace(expected_move=90.0, required_move=100.0))
+        self.assertLess(runner._target_r(weak), 2.0)           # ratio 0.9 -> below base
+        self.assertGreaterEqual(runner._target_r(weak), 1.0)   # floored
+        # Edge scaling disabled -> plain preferred_target_R.
+        runner2 = PaperRunner(self.cfg, RUNNER_CFG, state_dir=self.state_dir,
+                              client=FakeClient(history=history_rising()),
+                              master=make_master())
+        self.assertAlmostEqual(runner2._target_r(strong), 2.0)
+
+    def test_cycle_writes_candidates_log(self):
+        runner = PaperRunner(self.cfg, RUNNER_CFG, state_dir=self.state_dir,
+                             client=FakeClient(history=history_rising()),
+                             master=make_master())
+        runner.run_one_cycle()
+        path = self.state_dir / "candidates_log.csv"
+        self.assertTrue(path.exists())
+        with path.open("r", encoding="utf-8-sig", newline="") as f:
+            rows = list(csv.DictReader(f))
+        self.assertGreater(len(rows), 0)
+        for key in ("date", "comparable_score", "threshold", "grade", "decision",
+                    "direction", "execution", "exp_req_ratio", "spread_pct"):
+            self.assertIn(key, rows[0])
+
+    def test_prefilter_drops_unfillable_strikes(self):
+        payload = make_chain_payload()
+        for row in payload["data"]["optionsChain"]:
+            if row.get("strike_price") == 25000.0 and row.get("option_type") in ("CE", "PE"):
+                mid = (row["bid"] + row["ask"]) / 2
+                row["bid"] = mid - 2.0
+                row["ask"] = mid + 2.0
+                row["ltp"] = mid
+        client = FakeClient(payloads={"NSE:NIFTY50-INDEX": payload},
+                            history=history_rising())
+        runner = PaperRunner(self.cfg, RUNNER_CFG, state_dir=self.state_dir,
+                             client=client, master=make_master())
+        runner.run_one_cycle()
+        snap = runner.snapshot()
+        cands = snap["underlyings"].get("_candidates", [])
+        strikes = {c["strike"] for c in cands}
+        self.assertNotIn(25000.0, strikes)
+        self.assertGreaterEqual(snap["underlyings"].get("_prefiltered", 0), 2)
 
 
 if __name__ == "__main__":

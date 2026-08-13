@@ -50,18 +50,20 @@ class FyersAPIError(RuntimeError):
 class FyersCredentials:
     app_id: str          # full "APPID-100" string
     secret_id: str
+    pin: str = ""        # trading PIN required by Fyers v3 validate-refresh-token
 
     @property
     def app_id_hash(self) -> str:
         return hashlib.sha256(f"{self.app_id}:{self.secret_id}".encode()).hexdigest()
 
     @classmethod
-    def from_env(cls, app_id_env: str = "FYERS_APP_ID", secret_env: str = "FYERS_SECRET_ID") -> "FyersCredentials":
+    def from_env(cls, app_id_env: str = "FYERS_APP_ID", secret_env: str = "FYERS_SECRET_ID",
+                 pin_env: str = "FYERS_PIN") -> "FyersCredentials":
         app_id = os.getenv(app_id_env, "")
         secret = os.getenv(secret_env, "")
         if not app_id or not secret:
             raise FyersAPIError(f"Missing Fyers credentials in {app_id_env}/{secret_env}.")
-        return cls(app_id=app_id, secret_id=secret)
+        return cls(app_id=app_id, secret_id=secret, pin=os.getenv(pin_env, "") or "")
 
 
 @dataclass
@@ -188,12 +190,33 @@ class FyersRestClient:
         except FyersAPIError:
             return False
 
+    def _pin(self) -> str:
+        """Fyers v3 refresh requires the trading PIN. Prefer the FYERS_PIN env
+        var; fall back to a FYERS_PIN= line in creds.env next to the token file
+        (paper_state/creds.env, gitignored)."""
+        if self.credentials.pin:
+            return self.credentials.pin
+        try:
+            env_path = Path(self.tokens.path).parent / "creds.env"
+            if env_path.exists():
+                for line in env_path.read_text(encoding="utf-8").splitlines():
+                    line = line.strip()
+                    if line.startswith("FYERS_PIN=") and len(line) > len("FYERS_PIN="):
+                        return line[len("FYERS_PIN="):].strip().strip('"').strip("'")
+        except OSError:
+            pass
+        return ""
+
     def _refresh(self) -> None:
-        status, resp = _req(f"{AUTH_BASE}/validate-refresh-token", "POST", {
+        body = {
             "grant_type": "refresh_token",
             "appIdHash": self.credentials.app_id_hash,
             "refresh_token": self.tokens.refresh_token,
-        })
+        }
+        pin = self._pin()
+        if pin:
+            body["pin"] = pin
+        status, resp = _req(f"{AUTH_BASE}/validate-refresh-token", "POST", body)
         if not isinstance(resp, dict) or resp.get("s") != "ok" or not resp.get("access_token"):
             raise FyersAPIError(f"Refresh failed: {resp}")
         self.tokens.save(resp["access_token"], resp.get("refresh_token") or self.tokens.refresh_token)

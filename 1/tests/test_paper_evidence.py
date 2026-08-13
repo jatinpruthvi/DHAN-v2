@@ -12,6 +12,7 @@ from institutional_options.models import (
 )
 from institutional_options.paper_evidence import (
     AppendingCsv, PaperEvidenceCollector, build_evidence_report,
+    build_top_candidates_report,
 )
 from institutional_options.paper_runner import now_ist
 from institutional_options.paper_signal import PaperSignalCalculator
@@ -99,6 +100,30 @@ class EvidenceCsvTests(unittest.TestCase):
         self.assertIn("PAPER-EVIDENCE REPORT", text)
         self.assertIn("no data yet", text)
 
+    def test_record_candidates_writes_full_detail_rows(self):
+        cfg = SystemConfig.from_file(CFG_PATH)
+        scorer = OpportunityScorer(cfg)
+        strong = make_candidate({"direction": 90, "trade_quality": 90, "regime_confidence": 80,
+                                 "hostility": 10, "elasticity": 0.8, "expected_move": 200,
+                                 "required_move": 100, "ratio": 2.0, "ev_r": 1.0, "vol_edge": 2.0,
+                                 "convexity": 90, "execution": 90, "confidence": 90, "regime_fit": 90})
+        weak = make_candidate({"direction": 10, "trade_quality": 10, "regime_confidence": 40,
+                               "hostility": 60, "elasticity": 0.2, "expected_move": 50,
+                               "required_move": 200, "ratio": 0.25, "ev_r": -0.5, "vol_edge": 0.5,
+                               "convexity": 10, "execution": 10, "confidence": 10, "regime_fit": 10},
+                              underlying="BANKNIFTY", side=OptionType.PE, strike=57800.0)
+        evals = tuple(scorer.evaluate(c) for c in (strong, weak))
+        col = PaperEvidenceCollector(self.dir)
+        col.record_candidates(evals, ts=datetime(2026, 8, 12, 14, 30))
+        rows = list(self._csv_rows(self.dir / "candidates_log.csv"))
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["date"], "2026-08-12")
+        self.assertGreater(float(rows[0]["comparable_score"]), float(rows[1]["comparable_score"]))
+        for key in ("grade", "eligible", "decision", "direction", "convexity", "execution",
+                    "confidence", "exp_req_ratio", "bid", "ask", "mid", "spread_pct", "reasons"):
+            self.assertIn(key, rows[0])
+        self.assertIsInstance(rows[0]["reasons"], str)
+
     def _csv_rows(self, path):
         import csv
         with Path(path).open("r", encoding="utf-8-sig", newline="") as f:
@@ -143,6 +168,80 @@ class ReportWithTradeTests(unittest.TestCase):
         self.assertIn("win%", text)
 
 
+CANDIDATE_LOG_COLS = [
+    "ts", "date", "underlying", "side", "strike", "expiry", "dte", "grade",
+    "comparable_score", "opportunity_score", "threshold", "eligible", "decision",
+    "direction", "trade_quality", "market_hostility", "iv_crush", "convexity",
+    "execution", "confidence", "regime_fit", "premium_elasticity", "expected_move",
+    "required_move", "exp_req_ratio", "bid", "ask", "mid", "spread_pct", "reasons",
+]
+
+
+def _candidate_row(day, score, underlying="NIFTY", side="CE", strike=24500.0,
+                   decision="NO_EXCELLENT_CANDIDATE"):
+    return {
+        "ts": f"{day}T12:00:00", "date": day, "underlying": underlying, "side": side,
+        "strike": strike, "expiry": "2026-08-18", "dte": 6, "grade": "B",
+        "comparable_score": score, "opportunity_score": score, "threshold": 80.0,
+        "eligible": "True", "decision": decision, "direction": 60.0, "trade_quality": 55.0,
+        "market_hostility": 10.0, "iv_crush": 20.0, "convexity": 70.0, "execution": 80.0,
+        "confidence": 75.0, "regime_fit": 65.0, "premium_elasticity": 0.5,
+        "expected_move": 150.0, "required_move": 100.0, "exp_req_ratio": 1.5,
+        "bid": 99.0, "ask": 101.0, "mid": 100.0, "spread_pct": 1.98,
+        "reasons": "grade below threshold",
+    }
+
+
+class TopCandidatesReportTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_report_top10_per_day_with_summary(self):
+        ac = AppendingCsv(self.dir / "candidates_log.csv")
+        # Day 1: 12 candidates (scores 40..51) - only the top 10 may appear.
+        for i in range(12):
+            ac.append(_candidate_row("2026-08-11", 40.0 + i, strike=24500.0 + i))
+        # Day 2: 3 candidates, one well above the 80 gate.
+        for score in (85.0, 55.0, 45.0):
+            ac.append(_candidate_row("2026-08-12", score, underlying="BANKNIFTY", side="PE"))
+
+        text = build_top_candidates_report(self.dir)
+        self.assertIn("DAY 2026-08-11", text)
+        self.assertIn("DAY 2026-08-12", text)
+        day1 = text.split("DAY 2026-08-11")[1].split("DAY 2026-08-12")[0]
+        self.assertIn("51.0", day1)     # day-1 top score is shown
+        self.assertNotIn("40.0", day1)  # 12th-ranked candidate is cut by top-10
+        day2 = text.split("DAY 2026-08-12")[1].split("SCORE DISTRIBUTION")[0]
+        self.assertIn("85.0", day2)
+        self.assertIn("candidates>=80: 1", day2)
+        self.assertIn("SCORE DISTRIBUTION", text)
+        self.assertIn("THRESHOLD INSIGHT", text)
+        self.assertIn("all-time max score: 85.0", text)
+        self.assertIn("days with any candidate >= 80: 1 / 2", text)
+
+    def test_report_day_filter_and_missing_log(self):
+        self.assertIn("no candidates_log.csv yet", build_top_candidates_report(self.dir))
+        ac = AppendingCsv(self.dir / "candidates_log.csv")
+        ac.append(_candidate_row("2026-08-11", 70.0))
+        ac.append(_candidate_row("2026-08-12", 90.0))
+        text = build_top_candidates_report(self.dir, day="2026-08-12")
+        self.assertIn("DAY 2026-08-12", text)
+        self.assertNotIn("DAY 2026-08-11", text)
+
+    def test_report_top_n_override(self):
+        ac = AppendingCsv(self.dir / "candidates_log.csv")
+        for i in range(5):
+            ac.append(_candidate_row("2026-08-11", 60.0 + i))
+        text = build_top_candidates_report(self.dir, top_n=2)
+        day1 = text.split("DAY 2026-08-11")[1].split("SCORE DISTRIBUTION")[0]
+        self.assertIn("64.0", day1)
+        self.assertNotIn("\n   3 ", day1)  # only top 2 ranked rows shown
+
+
 class DailyRunTests(unittest.TestCase):
     def test_daily_run_archives_and_flags_tests(self):
         from institutional_options.daily_evidence_run import (
@@ -159,6 +258,8 @@ class DailyRunTests(unittest.TestCase):
             text = out.read_text(encoding="utf-8")
             self.assertIn("PAPER-EVIDENCE REPORT", text)
             self.assertIn("[PASS] emergency_tests_passed", text)
+            # The daily run must also produce the top-candidates report.
+            self.assertTrue((state / "top_candidates_report.txt").exists())
             archived = archive_report(state, out)
             self.assertTrue(archived.exists())
             self.assertIn("evidence_report_", archived.name)

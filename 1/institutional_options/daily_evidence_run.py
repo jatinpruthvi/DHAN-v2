@@ -44,12 +44,16 @@ def run_tests() -> bool:
 
 
 def generate_report(state_dir: Path, emergency_passed: bool) -> Path:
-    """Rebuild the evidence report via paper_evidence.build_evidence_report."""
+    """Rebuild the evidence report via paper_evidence.build_evidence_report and
+    the per-day top-N candidates report (threshold-calibration aid)."""
     import institutional_options.paper_evidence as ev
     text = ev.build_evidence_report(state_dir, emergency_tests_passed=emergency_passed)
     out = state_dir / "evidence_report.txt"
     out.write_text(text, encoding="utf-8")
     print(f"[daily] report written: {out}", flush=True)
+    top = state_dir / "top_candidates_report.txt"
+    top.write_text(ev.build_top_candidates_report(state_dir), encoding="utf-8")
+    print(f"[daily] top-candidates report written: {top}", flush=True)
     return out
 
 
@@ -61,6 +65,11 @@ def archive_report(state_dir: Path, source: Path) -> Path:
     target = reports / f"evidence_report_{stamp}.txt"
     target.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
     print(f"[daily] archived: {target}", flush=True)
+    top_src = state_dir / "top_candidates_report.txt"
+    if top_src.exists():
+        top_target = reports / f"top_candidates_{stamp}.txt"
+        top_target.write_text(top_src.read_text(encoding="utf-8"), encoding="utf-8")
+        print(f"[daily] archived: {top_target}", flush=True)
     return target
 
 

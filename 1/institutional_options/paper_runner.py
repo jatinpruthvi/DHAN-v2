@@ -18,6 +18,7 @@ Run:  python -m institutional_options.paper_runner
 from __future__ import annotations
 
 import csv
+import gzip
 import json
 import os
 import threading
@@ -35,7 +36,7 @@ from .fyers_client import FyersCredentials, FyersRestClient, FyersSymbolMaster, 
 from .fyers_parser import FyersOptionChainParser, parse_expiry_calendar, parse_india_vix
 from .lifecycle import (
     EXIT_BREAKEVEN, EXIT_END_OF_DATA, EXIT_LOSING_TIME, EXIT_NO_DATA,
-    EXIT_STOP, EXIT_TARGET, EXIT_TIME, EXIT_TRAIL,
+    EXIT_STOP, EXIT_TARGET, EXIT_TIME, EXIT_TRAIL, EXIT_VOL_TIME,
     ExitPolicy, MarketBar, SimulatedTradeLifecycle,
 )
 from .models import OptionType, PaperFill, PaperTrade, Quote
@@ -45,7 +46,7 @@ from .paper_signal import PaperSignalCalculator
 from .scoring import PaperFillSimulator
 
 IST = timezone(timedelta(hours=5, minutes=30))
-ACTIVE_EXIT_REASONS = {EXIT_TARGET, EXIT_STOP, EXIT_BREAKEVEN, EXIT_TRAIL, EXIT_TIME, EXIT_LOSING_TIME}
+ACTIVE_EXIT_REASONS = {EXIT_TARGET, EXIT_STOP, EXIT_BREAKEVEN, EXIT_TRAIL, EXIT_TIME, EXIT_LOSING_TIME, EXIT_VOL_TIME}
 
 
 def now_ist() -> datetime:
@@ -110,12 +111,14 @@ class PaperRunner:
     def __init__(self, config: SystemConfig, runner_cfg: Mapping[str, Any],
                  state_dir: str | Path = "paper_state",
                  client: Optional[FyersRestClient] = None,
-                 master: Optional[FyersSymbolMaster] = None):
+                 master: Optional[FyersSymbolMaster] = None,
+                 replay: bool = False):
         self.base_config = config
         self.cfg = runner_cfg
         self.state_dir = Path(state_dir)
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.state = RunnerState(session_id=now_ist().strftime("%Y%m%d_%H%M%S"))
+        self._replay = bool(replay)
 
         # Paper-only config overrides (PARAMETERS.json is never modified).
         # With the frozen risk caps, a real NIFTY/BANKNIFTY ATM premium
@@ -128,6 +131,8 @@ class PaperRunner:
 
         if client is not None:
             self.client = client
+        elif self._replay:
+            raise ValueError("replay mode requires an injected replay client")
         else:
             creds = FyersCredentials.from_env()
             self.client = FyersRestClient(creds, TokenStore(self.state_dir / "tokens.json"))
@@ -152,9 +157,23 @@ class PaperRunner:
         self.strikecount = int(self.cfg.get("strikecount", 30))
         self.entry_hold_seconds = int(self.config.section("holding_time")["normal_max_hold_minutes"]) * 60
         self.universe = self._universe()
+        if master is None and self._replay:
+            # Replay is offline: load the cached symbol master (no auth needed).
+            cached = self.state_dir / "NSE_FO.csv"
+            if cached.exists():
+                master = FyersSymbolMaster.from_csv(cached)
         self.master = master if master is not None else self._load_master()
         self._journal_path = self.state_dir / "trades.csv"
         self._write_journal_header()
+        # Session capture: every cycle's raw chain/history payloads, gzipped
+        # JSONL, for offline replay + parameter sweeps (paper_state/sessions/).
+        self._capture = bool(self.cfg.get("capture", False))
+        self._capture_file = None
+        if self._capture:
+            sess_dir = self.state_dir / "sessions"
+            sess_dir.mkdir(parents=True, exist_ok=True)
+            self._capture_file = gzip.open(sess_dir / f"{self.state.session_id}.jsonl.gz",
+                                           "wt", encoding="utf-8")
         self._log(f"Paper runner ready. Universe: {', '.join(self.universe)}")
 
     # -- setup -----------------------------------------------------------------
@@ -192,16 +211,23 @@ class PaperRunner:
 
     def run_forever(self, stop_event: Optional[threading.Event] = None) -> None:
         self._log("Loop started.")
-        while stop_event is None or not stop_event.is_set():
-            try:
-                self.run_one_cycle()
-            except Exception as e:  # keep the loop alive across transient failures
-                self.state.last_cycle_ok = False
-                self.state.last_error = f"{type(e).__name__}: {e}"
-                self._log(f"Cycle error: {self.state.last_error}")
-            wait = self.poll_seconds if self.state.market_open else self._seconds_to_open()
-            if wait > 0:
-                time.sleep(min(wait, self.poll_seconds if self.state.market_open else 60.0))
+        try:
+            while stop_event is None or not stop_event.is_set():
+                try:
+                    self.run_one_cycle()
+                except Exception as e:  # keep the loop alive across transient failures
+                    self.state.last_cycle_ok = False
+                    self.state.last_error = f"{type(e).__name__}: {e}"
+                    self._log(f"Cycle error: {self.state.last_error}")
+                wait = self.poll_seconds if self.state.market_open else self._seconds_to_open()
+                if wait > 0:
+                    time.sleep(min(wait, self.poll_seconds if self.state.market_open else 60.0))
+        finally:
+            if self._capture_file is not None:
+                try:
+                    self._capture_file.close()
+                except Exception:
+                    pass
 
     def run_one_cycle(self) -> None:
         now = now_ist()
@@ -212,6 +238,8 @@ class PaperRunner:
         chains: dict[str, OptionChainSnapshot] = {}
         vix_map: dict[str, Optional[float]] = {}
         context_map = {}
+        payloads: dict[str, Any] = {}
+        histories: dict[str, Any] = {}
         for und, meta in self.universe.items():
             try:
                 payload = self.client.option_chain(meta["index_symbol"], self.strikecount)
@@ -222,16 +250,20 @@ class PaperRunner:
                 chains[und] = chain
                 vix_map[und] = vix
                 history = self._fetch_history(und, meta["index_symbol"])
+                histories[und] = history
+                payloads[und] = payload
                 context_map[und] = self.signal.compute_context(chain, vix, now, history_candles=history)
             except Exception as e:
                 self.state.underlyings[und] = {"error": f"{type(e).__name__}: {e}"}
                 self._log(f"  {und} chain error: {e}")
         if not chains:
             raise RuntimeError("No underlying chains fetched this cycle.")
+        if self._capture_file is not None:
+            self._capture_cycle(payloads, histories, now)
         self._update_chain_display(chains, vix_map, context_map)
 
         # Manage the open position with fresh bars before considering new entries.
-        self._manage_open_position(chains)
+        self._manage_open_position(chains, context_map)
 
         # Build candidates from all fresh chains and select.
         if self.state.open_position is None:
@@ -245,6 +277,7 @@ class PaperRunner:
 
     def _build_candidates(self, chains, context_map) -> list:
         out = []
+        self.state.underlyings["_prefiltered"] = 0
         for und, chain in chains.items():
             ctx = context_map[und]
             try:
@@ -281,6 +314,15 @@ class PaperRunner:
                     opportunity_confidence_score=proxies.opportunity_confidence_score,
                     regime_fit_score=proxies.regime_fit_score,
                 )
+                # Spread-cost pre-filter: skip strikes the conservative paper
+                # fill model would refuse at entry (wide OR pathologically tight
+                # spreads), so un-fillable candidates never waste an evaluation
+                # or selection cycle. Uses the real simulator -> exact match.
+                probe = self.fill_sim.entry_buy(c.quote, c.instrument.tick_size)
+                if not probe.filled:
+                    self.state.underlyings["_prefiltered"] = \
+                        int(self.state.underlyings.get("_prefiltered", 0)) + 1
+                    continue
                 out.append(c)
         return out
 
@@ -306,6 +348,12 @@ class PaperRunner:
                 self.evidence.record_skipped(result.evaluations, ranking_cycle_id=cycle_id)
             except Exception as e:
                 self._log(f"  evidence record_skipped failed: {e}")
+            # Full candidate log (all grades) -> candidates_log.csv, the source
+            # for the per-day top-N report used to calibrate the score threshold.
+            try:
+                self.evidence.record_candidates(result.evaluations, ts=now_ist())
+            except Exception as e:
+                self._log(f"  evidence record_candidates failed: {e}")
         selected = result.selected
         if selected is None:
             return
@@ -328,7 +376,7 @@ class PaperRunner:
             entry_time=now_ist(),
         )
         stop = max(selected.risk_plan.hard_stop_points, 1.0)
-        target_r = float(self.config.section("expected_move").get("preferred_target_R", 2.0))
+        target_r = self._target_r(selected)
         pos = OpenPosition(
             trade=trade,
             symbol=symbol,
@@ -344,9 +392,28 @@ class PaperRunner:
         self.state.open_position = pos
         self._log(f"OPEN {symbol} @ {fill.fill_price:.2f} stop={stop:.2f} target={stop*target_r:.2f}")
 
+    def _target_r(self, selected) -> float:
+        """Target in R multiples. Base is preferred_target_R; when edge-scaled
+        targets are enabled (exit_management.edge_scaled_target), the target is
+        scaled by the candidate's expected/required ratio so high-edge setups
+        are given room to run and marginal ones are banked earlier. The stop is
+        never changed, so worst-case per-trade risk is identical."""
+        base = float(self.config.section("expected_move").get("preferred_target_R", 2.0))
+        raw = self.config.raw.get("exit_management")
+        if not (isinstance(raw, Mapping) and raw.get("edge_scaled_target")):
+            return base
+        try:
+            ratio = selected.candidate.expected_move / max(selected.candidate.required_move, 1e-9)
+            min_ratio = float(raw.get("edge_scale_min_ratio", 1.1))
+            min_r = float(raw.get("edge_scale_min_r", 1.0))
+            max_r = float(raw.get("edge_scale_max_r", 3.0))
+            return min(max(base * (ratio / min_ratio), min_r), max_r)
+        except (TypeError, ValueError):
+            return base
+
     # -- open position management -----------------------------------------------
 
-    def _manage_open_position(self, chains) -> None:
+    def _manage_open_position(self, chains, context_map=None) -> None:
         pos = self.state.open_position
         if pos is None:
             return
@@ -358,11 +425,13 @@ class PaperRunner:
                                pos.trade.entry_evaluation.candidate.side)
         except Exception:
             return
+        ctx = (context_map or {}).get(pos.underlying)
         bar = MarketBar(
             timestamp=now_ist(),
             quote=leg.quote,
             futures_price=chain.underlying_price,
             iv=leg.implied_volatility,
+            expected_move_remaining=ctx.regime_projected_move if ctx is not None else None,
         )
         pos.bars.append(bar)
         pos.last_premium = leg.quote.mid
@@ -483,6 +552,17 @@ class PaperRunner:
         if len(self.state.equity) > 5000:
             self.state.equity = self.state.equity[-5000:]
 
+    def _capture_cycle(self, payloads: dict, histories: dict, now: datetime) -> None:
+        """Append one cycle of raw chain/history payloads to the session capture
+        file (paper_state/sessions/<session>.jsonl.gz) for offline replay and
+        parameter sweeps."""
+        try:
+            rec = {"ts": now.isoformat(), "chains": payloads, "history": histories}
+            self._capture_file.write(json.dumps(rec, default=str) + "\n")
+            self._capture_file.flush()
+        except Exception as e:
+            self._log(f"  capture failed: {e}")
+
     def snapshot(self) -> dict[str, Any]:
         pos = self.state.open_position
         pos_view = None
@@ -538,6 +618,8 @@ class PaperRunner:
             "trail_distance_r": p.trail_distance_r,
             "losing_time_stop_fraction": p.losing_time_stop_fraction,
             "time_decay_tighten": p.time_decay_tighten,
+            "vol_time_stop_fraction": p.vol_time_stop_fraction,
+            "stop_exit_slippage_frac": p.stop_exit_slippage_frac,
         }
 
     # -- journal -------------------------------------------------------------------
@@ -578,6 +660,14 @@ class PaperRunner:
         return (24 * 3600)
 
     def _fetch_history(self, underlying: str, index_symbol: str) -> list:
+        # Replay mode is offline and per-cycle: never cache across cycles.
+        if self._replay:
+            try:
+                resp = self.client.history(index_symbol, resolution="1")
+                candles = resp.get("candles", []) if isinstance(resp, dict) else (resp or [])
+                return [c for c in candles if isinstance(c, (list, tuple)) and len(c) >= 5][-self.history_bars:]
+            except Exception:
+                return []
         cached = self.history_cache.get(underlying)
         if cached is not None and (time.time() - cached[0]) < 60.0:
             return cached[1]
