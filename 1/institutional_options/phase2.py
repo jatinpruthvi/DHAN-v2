@@ -179,8 +179,14 @@ class DryRunValidator:
         min_candidates = int(self.criteria["minimum_paper_trade_candidates"])
         candidates = len(mtil.rows) + len(skipped.rows)
         checks.append(CheckResult("minimum_paper_trade_candidates", candidates >= min_candidates, candidates, min_candidates, "CRITICAL", "Simulated/tracked candidates recorded."))
-        final_dates = sorted(mtil.unique_dates())[-5:]
-        final_rows = [r for r in mtil.rows if _parse_date(r.get("date")) in set(final_dates)] if final_dates else []
+        final_dates = sorted(mtil.unique_dates() | skipped.unique_dates())[-5:]
+        final_date_set = set(final_dates)
+        final_rows = [
+            row
+            for rows in (mtil.rows, skipped.rows)
+            for row in rows
+            if _parse_date(row.get("date") or row.get("timestamp")) in final_date_set
+        ] if final_dates else []
         mapping_flags = [r.get("mapping_validation_passed") for r in final_rows if r.get("mapping_validation_passed") not in (None, "")]
         mapping_errors = sum(1 for v in mapping_flags if not _parse_bool(v)) if mapping_flags else self._count_rule_text(final_rows, ["mapping", "security", "instrument"])
         checks.append(CheckResult("critical_mapping_errors_final_5_days", mapping_errors == 0, mapping_errors, 0, "CRITICAL", "No critical mapping errors in final five dry-run days."))
@@ -206,6 +212,28 @@ class DryRunValidator:
         checks.append(CheckResult("paper_fill_simulator_active", paper_fill_active, paper_fill_active, True, "CRITICAL", "Paper-fill simulator evidence present."))
         mtil_complete = self._mtil_core_completeness(mtil) >= 0.95 if mtil.rows else False
         checks.append(CheckResult("mtil_core_completeness", mtil_complete, f"{self._mtil_core_completeness(mtil):.2%}", ">=95%", "CRITICAL", "Core MTIL fields are populated."))
+        cost_values = [r.get("cost_model_valid") for r in mtil.rows]
+        cost_fields_present = bool(mtil.rows) and all(value not in (None, "") for value in cost_values)
+        canonical_values = [r.get("canonical_promotion_allowed") for r in mtil.rows]
+        canonical_fields_present = bool(mtil.rows) and all(value not in (None, "") for value in canonical_values)
+        cost_boundary_ok = cost_fields_present and all(_parse_bool(value) for value in cost_values)
+        canonical_boundary_ok = canonical_fields_present and all(_parse_bool(value) for value in canonical_values)
+        checks.append(CheckResult(
+            "cost_model_validity",
+            cost_boundary_ok,
+            f"{sum(_parse_bool(value) for value in cost_values)}/{len(cost_values)}; fields_present={cost_fields_present}",
+            "all MTIL rows true with field present",
+            "CRITICAL",
+            "Canonical acceptance requires explicit validated transaction-cost evidence; placeholder or missing cost flags fail closed.",
+        ))
+        checks.append(CheckResult(
+            "canonical_promotion_boundary",
+            canonical_boundary_ok,
+            f"{sum(_parse_bool(value) for value in canonical_values)}/{len(canonical_values)}; fields_present={canonical_fields_present}",
+            "all MTIL rows true with field present",
+            "CRITICAL",
+            "Canonical promotion must be explicitly allowed on every accepted MTIL row.",
+        ))
         skipped_complete = self._skipped_core_completeness(skipped) >= 0.90 if skipped.rows else False
         checks.append(CheckResult("skipped_candidate_logging", skipped_complete, f"{self._skipped_core_completeness(skipped):.2%}", ">=90%", "CRITICAL", "Skipped candidate log fields are populated."))
         if dashboard_latency_pass_rate_pct is not None:

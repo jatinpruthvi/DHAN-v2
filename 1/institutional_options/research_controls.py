@@ -497,7 +497,8 @@ class InstrumentCalibrationStore:
                        net_pnl: float, success: Optional[bool] = None,
                        instrument_id: Optional[str] = None, paper: bool = False,
                        features: Optional[Mapping[str, Any]] = None,
-                       observed_at: Optional[datetime] = None) -> None:
+                       observed_at: Optional[datetime] = None,
+                       cost_model_valid: bool = True) -> None:
         observed_at = observed_at or datetime.now(timezone.utc)
         key = str(instrument_class)
         row = self.state.setdefault("outcomes", {}).setdefault(key, {
@@ -506,15 +507,16 @@ class InstrumentCalibrationStore:
         })
         if success is None:
             success = float(r_multiple) > 0.0
-        row["count"] = int(row.get("count", 0)) + 1
-        row["wins"] = int(row.get("wins", 0)) + int(bool(success))
-        row["sum_r"] = float(row.get("sum_r", 0.0)) + float(r_multiple)
-        row["sum_pnl"] = float(row.get("sum_pnl", 0.0)) + float(net_pnl)
-        bucket = self.score_bucket(score)
-        bucket_row = row.setdefault("score_buckets", {}).setdefault(bucket, {"count": 0, "wins": 0, "sum_r": 0.0})
-        bucket_row["count"] += 1
-        bucket_row["wins"] += int(bool(success))
-        bucket_row["sum_r"] += float(r_multiple)
+        if cost_model_valid:
+            row["count"] = int(row.get("count", 0)) + 1
+            row["wins"] = int(row.get("wins", 0)) + int(bool(success))
+            row["sum_r"] = float(row.get("sum_r", 0.0)) + float(r_multiple)
+            row["sum_pnl"] = float(row.get("sum_pnl", 0.0)) + float(net_pnl)
+            bucket = self.score_bucket(score)
+            bucket_row = row.setdefault("score_buckets", {}).setdefault(bucket, {"count": 0, "wins": 0, "sum_r": 0.0})
+            bucket_row["count"] += 1
+            bucket_row["wins"] += int(bool(success))
+            bucket_row["sum_r"] += float(r_multiple)
         if instrument_id:
             gate_row = self.state.setdefault("gate_learning", {}).setdefault(str(instrument_id), {
                 "instrument_class": key, "observations": [], "outcomes": [], "sessions": [],
@@ -528,7 +530,8 @@ class InstrumentCalibrationStore:
                     normalized[name] = str(value)
             gate_row["outcomes"].append({
                 "ts": observed_at.isoformat(), "score": float(score), "r_multiple": float(r_multiple), "net_pnl": float(net_pnl),
-                "success": bool(success), "paper": bool(paper), "proxy": False, "features": normalized,
+                "success": bool(success), "paper": bool(paper), "proxy": False,
+                "cost_model_valid": bool(cost_model_valid), "features": normalized,
             })
             gate_row["outcomes"] = gate_row["outcomes"][-1000:]
             inst = self.state.setdefault("instruments", {}).setdefault(str(instrument_id), {
@@ -553,8 +556,12 @@ class InstrumentCalibrationStore:
             self._refresh_optimizer(str(instrument_id), key)
         self._save()
 
-    def record_forward_outcomes(self, rows: list[Mapping[str, Any]]) -> int:
-        """Persist observed skipped-forward rows as proxy research outcomes only."""
+    def record_forward_outcomes(self, rows: list[Mapping[str, Any]], cost_model_valid: bool = False) -> int:
+        """Persist observed skipped-forward rows as proxy research outcomes only.
+
+        Proxy rows remain research-only and are excluded from canonical optimizer
+        validation unless the current cost model is explicitly validated.
+        """
         added = 0
         touched: set[tuple[str, str]] = set()
         for source in rows:
@@ -587,6 +594,7 @@ class InstrumentCalibrationStore:
                 "ts": observed_at.isoformat(), "skip_id": dedupe_key[0], "window_minutes": dedupe_key[1],
                 "score": score, "r_multiple": r_multiple, "success": r_multiple > 0.0,
                 "features": {str(k): v for k, v in features.items()}, "proxy": True,
+                "cost_model_valid": bool(cost_model_valid),
             })
             row["forward_outcomes"] = row["forward_outcomes"][-2000:]
             touched.add((key, instrument_class))
@@ -739,8 +747,8 @@ class InstrumentCalibrationStore:
         """Recompute research diagnostics and persist only validated gate changes."""
         row = self.state.setdefault("gate_learning", {}).setdefault(str(instrument_id), {})
         observations = list(row.get("observations", []))
-        actual = [item for item in row.get("outcomes", []) if isinstance(item, Mapping)]
-        proxy = [item for item in row.get("forward_outcomes", []) if isinstance(item, Mapping)]
+        actual = [item for item in row.get("outcomes", []) if isinstance(item, Mapping) and item.get("cost_model_valid") is True]
+        proxy = [item for item in row.get("forward_outcomes", []) if isinstance(item, Mapping) and item.get("cost_model_valid") is True]
         min_obs = _safe_int(self.learning_rules.get("minimum_learning_observations"), 100)
         min_days = max(_safe_int(self.learning_rules.get("minimum_learning_days"), 20), _safe_int(self.learning_rules.get("warmup_days"), 5))
         min_outcomes = _safe_int(self.learning_rules.get("minimum_learning_outcomes"), 20)
@@ -953,16 +961,33 @@ class InstrumentCalibrationStore:
         learning = self.state.get("gate_learning", {}).get(str(instrument_id), {})
         optimizer = learning.get("optimizer", {}) if isinstance(learning, Mapping) else {}
         observations = int(row.get("observations", 0))
+        valid_outcomes = [
+            item for item in learning.get("outcomes", [])
+            if isinstance(item, Mapping) and item.get("cost_model_valid") is True
+        ]
+        valid_shadow = [item for item in valid_outcomes if not bool(item.get("paper"))]
+        valid_paper = [item for item in valid_outcomes if bool(item.get("paper"))]
+        shadow_values = [float(item.get("r_multiple", 0.0)) for item in valid_shadow]
+        paper_values = [float(item.get("r_multiple", 0.0)) for item in valid_paper]
+        paper_peak = 0.0
+        paper_cumulative = 0.0
+        paper_drawdown = 0.0
+        for value in paper_values:
+            paper_cumulative += value
+            paper_peak = max(paper_peak, paper_cumulative)
+            paper_drawdown = max(paper_drawdown, paper_peak - paper_cumulative)
         return {
             "observations": observations,
             "sessions": len(row.get("sessions", [])),
             "valid_quote_rate": float(row.get("valid_quotes", 0)) / observations if observations else 0.0,
             "paper_fill_rate": float(row.get("paper_fills", 0)) / observations if observations else 0.0,
-            "shadow_outcomes": int(row.get("shadow_outcomes", 0)),
-            "shadow_net_expectancy_r": (float(row.get("shadow_sum_r", 0.0)) / int(row.get("shadow_outcomes", 1))) if int(row.get("shadow_outcomes", 0)) else None,
-            "paper_trades": int(row.get("paper_trades", 0)),
-            "paper_net_expectancy_r": (float(row.get("paper_sum_r", 0.0)) / int(row.get("paper_trades", 1))) if int(row.get("paper_trades", 0)) else None,
-            "max_drawdown_r": float(row.get("max_drawdown_r", 0.0)),
+            "shadow_outcomes": len(valid_shadow),
+            "shadow_net_expectancy_r": (sum(shadow_values) / len(shadow_values)) if shadow_values else None,
+            "paper_trades": len(valid_paper),
+            "paper_net_expectancy_r": (sum(paper_values) / len(paper_values)) if paper_values else None,
+            "max_drawdown_r": paper_drawdown,
+            "cost_valid_outcomes": len(valid_outcomes),
+            "cost_invalid_outcomes": max(0, len([item for item in learning.get("outcomes", []) if isinstance(item, Mapping)]) - len(valid_outcomes)),
             "gate_optimization_status": optimizer.get("status", "NOT_READY"),
             "gate_validation_observations": int(optimizer.get("validation_observations", 0) or 0),
             "gate_validation_sessions": int(optimizer.get("validation_sessions", 0) or 0),

@@ -109,15 +109,16 @@ class RequiredStopModelTests(unittest.TestCase):
         payload = {"data": {"last_price": 25000, "oc": {"25000.000000": {
             "ce": {"top_bid_price": 100, "top_ask_price": 100.5, "top_bid_quantity": 1000, "top_ask_quantity": 1000,
                    "last_price": 100.25, "security_id": 1, "oi": 1000, "previous_oi": 900, "volume": 10000,
-                   "greeks": {"delta": 0.5}, "implied_volatility": 12},
+                   "greeks": {"delta": 0.5}, "implied_volatility": 12, "source_timestamp": "2026-06-01T10:00:00+05:30"},
             "pe": {"top_bid_price": 100, "top_ask_price": 100.5, "top_bid_quantity": 1000, "top_ask_quantity": 1000,
                    "last_price": 100.25, "security_id": 2, "oi": 1000, "previous_oi": 900, "volume": 10000,
-                   "greeks": {"delta": -0.5}, "implied_volatility": 12}}}}}
+                   "greeks": {"delta": -0.5}, "implied_volatility": 12, "source_timestamp": "2026-06-01T10:00:00+05:30"}}}}}
         chain = DhanOptionChainParser.parse(payload, "NIFTY", "2026-06-30")
         ctx = CandidateFactoryContext(25000, 25000, 80, 80, 80, 10, 100, 100, 80, 10,
                                       CalibrationStatus.UNVALIDATED, CalibrationStatus.UNVALIDATED)
         cands = CandidateFactory(self.cfg).candidates_from_chain(chain, date(2026, 6, 30), 75, 0.05, ctx)
         c = cands[0]
+        self.assertTrue(c.quote.source_timestamp_available)
         # Logical stop is a fraction of premium (~20.05), not the 80-point required move.
         self.assertAlmostEqual(c.required_stop_points, 100.25 * 0.2, places=6)
         self.assertNotAlmostEqual(c.required_stop_points, c.required_move)

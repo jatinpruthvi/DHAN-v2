@@ -175,4 +175,5 @@ class FyersOptionChainParser:
             previous_volume=0,
             average_price=None,
             previous_close_price=None,
+            source_timestamp=source_ts,
         )

@@ -257,6 +257,14 @@ class ResearchControlTests(unittest.TestCase):
             self.assertAlmostEqual(metrics["paper_net_expectancy_r"], 1.0 / 6.0)
             self.assertAlmostEqual(metrics["max_drawdown_r"], 1.5)
 
+    def test_unvalidated_cost_outcome_cannot_enter_canonical_calibration(self):
+        with tempfile.TemporaryDirectory() as d:
+            store = InstrumentCalibrationStore(d, CONFIG)
+            cls = InstrumentClass.NSE_INDEX.value
+            store.record_outcome(cls, 80.0, 2.0, 100.0, instrument_id="NIFTY", paper=False, cost_model_valid=False)
+            self.assertEqual(store.state["outcomes"][cls]["count"], 0)
+            self.assertFalse(store.state["gate_learning"]["NIFTY"]["outcomes"][0]["cost_model_valid"])
+
     def test_promotion_retires_materially_negative_shadow_state(self):
         with tempfile.TemporaryDirectory() as d:
             store = InstrumentCalibrationStore(d, CONFIG)

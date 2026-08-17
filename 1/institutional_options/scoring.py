@@ -191,6 +191,11 @@ class OpportunityScorer:
         self.gate_provider = gate_provider
         self.contract_quality = ContractQualityCalculator(config)
         self.risk = DynamicRiskCalculator(config)
+        self.runtime_mode = "NORMAL"
+
+    def set_runtime_mode(self, mode: str) -> None:
+        normalized = str(mode or "NORMAL").upper()
+        self.runtime_mode = normalized if normalized in {"NORMAL", "DEFENSIVE", "SURVIVAL"} else "NORMAL"
 
     def evaluate(self, candidate: CandidateInputs, realized_loss_today: float = 0.0) -> OpportunityEvaluation:
         reasons: list[str] = []
@@ -205,7 +210,7 @@ class OpportunityScorer:
             setup_grade_source = "SCORE_FALLBACK"
         risk_plan = self.risk.plan(RiskContext(
             capital=float(self.config.section("capital")["starting_capital"]),
-            mode="NORMAL",
+            mode=self.runtime_mode,
             setup_grade=setup_grade_hint,
             lots=1,
             entry_premium=candidate.quote.mid,

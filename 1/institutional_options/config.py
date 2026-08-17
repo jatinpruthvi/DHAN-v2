@@ -33,6 +33,7 @@ class SystemConfig:
         required = [
             "capital",
             "risk",
+            "execution",
             "data_health",
             "liquidity",
             "premium_elasticity",
@@ -130,6 +131,15 @@ class SystemConfig:
                     raise ConfigError("Required-stop premium_stop_pct must be positive.")
             except (TypeError, ValueError):
                 raise ConfigError("Required-stop premium_stop_pct must be numeric.")
+        operator_controls = self.raw.get("operator_controls", {})
+        if operator_controls and not isinstance(operator_controls, Mapping):
+            raise ConfigError("operator_controls must be an object when provided.")
+        if isinstance(operator_controls, Mapping):
+            for key in ("daily_mode_path", "market_context_path"):
+                if key in operator_controls and not str(operator_controls.get(key, "")).strip():
+                    raise ConfigError(f"operator_controls.{key} must be a non-empty path.")
+            if "manual_mode_can_loosen" in operator_controls and operator_controls.get("manual_mode_can_loosen") is not False:
+                raise ConfigError("operator_controls.manual_mode_can_loosen must remain false.")
         if universe.get("max_open_positions") != 1 or universe.get("max_pending_orders") != 1:
             raise ConfigError("Global position and pending order limits must be 1.")
         if universe.get("trade_only_best_ranked_candidate") is not True:

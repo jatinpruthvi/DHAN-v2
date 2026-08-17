@@ -20,6 +20,9 @@ class PaperOpportunityEngine:
         self.config = config
         self.scorer = OpportunityScorer(config, gate_provider=gate_provider)
 
+    def set_runtime_mode(self, mode: str) -> None:
+        self.scorer.set_runtime_mode(mode)
+
     def evaluate_and_select(self, candidates: Iterable, state: Optional[PaperPortfolioState] = None, allowed_playbooks: Optional[AbstractSet[str]] = None) -> SelectionResult:
         state = state or PaperPortfolioState()
         if state.open_positions_count >= 1:

@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import Any, Mapping, Optional
 
 from .config import ConfigError, SystemConfig
-from .costs import ChargesConfig, CostCalculator
+from .costs import ChargesConfig, CostCalculator, validate_charges_config
 from .candidates import CandidateFactory, CandidateFactoryContext
 from .engine import PaperOpportunityEngine, PaperPortfolioState
 from .fyers_client import FyersCredentials, FyersRestClient, FyersSymbolMaster, TokenStore
@@ -42,7 +42,7 @@ from .lifecycle import (
     EXIT_STOP, EXIT_TARGET, EXIT_TIME, EXIT_TRAIL, EXIT_VOL_TIME,
     ExitPolicy, MarketBar, SimulatedTradeLifecycle,
 )
-from .models import DataHealth, OptionType, PaperFill, PaperTrade, Quote
+from .models import DataHealth, OptionType, PaperFill, PaperTrade, Quote, TradeDecision
 from .market_metrics import PortfolioNoTradeCalculator
 from .observed_metrics import RollingPremiumElasticity
 from .option_chain import OptionChainSnapshot
@@ -51,6 +51,7 @@ from .surface_diagnostics import OptionSurfaceDiagnostics
 from .paper_evidence import PaperEvidenceCollector
 from .paper_signal import PaperSignalCalculator
 from .orchestrators import DataHealthOrchestrator
+from .operator_controls import load_daily_mode, load_market_context
 from .research_controls import (
     InstrumentCalibrationStore, InstrumentLifecycle, PortfolioOverlapGuard,
     PromotionEngine, PromotionMetrics, class_for_metadata, exposure_group, gate_feature_snapshot,
@@ -186,8 +187,17 @@ class PaperRunner:
         self.history_bars = int(self.cfg.get("history_bars", 30))
         self.history_cache: dict[str, list] = {}
 
-        charges = ChargesConfig.from_file("uploads/CHARGES_CONFIG.json")
+        charges_path = Path("uploads/CHARGES_CONFIG.json")
+        charges = ChargesConfig.from_file(charges_path)
         self.costs = CostCalculator(charges)
+        charges_validation = validate_charges_config(charges_path)
+        self._cost_model_valid = bool(charges_validation.valid)
+        self._cost_model_status = "COST_MODEL_VALIDATED" if self._cost_model_valid else "COST_MODEL_UNVALIDATED"
+        self.state.underlyings["_cost_model"] = {
+            "status": self._cost_model_status,
+            "canonical_promotion_allowed": self._cost_model_valid,
+            "reasons": list(charges_validation.reasons),
+        }
 
         self.poll_seconds = float(self.cfg.get("poll_seconds", 5.0))
         self.strikecount = int(self.cfg.get("strikecount", 30))
@@ -220,6 +230,26 @@ class PaperRunner:
         self.event_ledger = ResearchEventLedger(self.state_dir, self.versions)
         self.evidence = PaperEvidenceCollector(self.state_dir, self.versions)
         self.scorer_engine = PaperOpportunityEngine(self.config, gate_provider=self.calibration.gates_for)
+        operator_controls = self.config.raw.get("operator_controls", {})
+        if not isinstance(operator_controls, Mapping):
+            operator_controls = {}
+        self._daily_mode_path = str(operator_controls.get("daily_mode_path", "uploads/DAILY_MODE.txt"))
+        self._market_context_path = str(operator_controls.get("market_context_path", "uploads/DAILY_MARKET_CONTEXT.json"))
+        computed_mode = self._computed_daily_mode()
+        self.daily_mode = load_daily_mode(self._daily_mode_path, computed_mode, now=now_ist())
+        self.scorer_engine.set_runtime_mode(self.daily_mode.effective_mode)
+        self.state.underlyings["_daily_mode"] = {
+            "computed_mode": self.daily_mode.computed_mode,
+            "effective_mode": self.daily_mode.effective_mode,
+            "status": self.daily_mode.status,
+            "reason": self.daily_mode.reason,
+            "path": self.daily_mode.path,
+        }
+        self.event_ledger.append(
+            "DAILY_MODE_CONTEXT", session_id=self.state.session_id,
+            decision_source="daily_mode_operator_control", ts=now_ist(),
+            payload=self.state.underlyings["_daily_mode"],
+        )
         self.revalidator = CandidateRevalidator(self.config)
         self.data_health = DataHealthOrchestrator(self.config)
         self.portfolio_no_trade = PortfolioNoTradeCalculator()
@@ -514,6 +544,7 @@ class PaperRunner:
         now = now_ist()
         self._roll_daily_risk_state(now)
         self._risk_context = self._load_risk_context()
+        self._refresh_daily_controls(now)
         self.state.market_open = self._market_open(now)
         if not self.state.market_open:
             if self.state.open_position is not None and now.weekday() < 5 and now.hour * 60 + now.minute > 15 * 60 + 30:
@@ -614,7 +645,7 @@ class PaperRunner:
             }
         try:
             forward_rows = self.evidence.observe_skipped_forward(chains, now)
-            self.calibration.record_forward_outcomes(forward_rows)
+            self.calibration.record_forward_outcomes(forward_rows, cost_model_valid=self._cost_model_valid)
         except Exception as e:
             self._log(f"  skipped forward observation failed: {e}")
 
@@ -804,9 +835,16 @@ class PaperRunner:
                     "evidence_profile": str(self.config.raw.get("evidence_profiles", {}).get("active_profile", "UNSPECIFIED")),
                     "elasticity_status": str(self.config.raw.get("evidence_profiles", {}).get("elasticity_status", "UNSPECIFIED")),
                     "mapping_status": str(self.config.raw.get("evidence_profiles", {}).get("mapping_status", "UNSPECIFIED")),
-                    "cost_model_status": str(self.config.raw.get("evidence_profiles", {}).get("cost_status", "UNSPECIFIED")),
+                    "cost_model_status": self._cost_model_status,
+                    "cost_model_valid": self._cost_model_valid,
+                    "canonical_promotion_allowed": self._cost_model_valid,
                     "liquidity_data_status": "MEASURED" if c.quote.bid_qty > 0 and c.quote.ask_qty > 0 and (c.quote.cumulative_bid_qty_5depth or 0) > 0 and (c.quote.cumulative_ask_qty_5depth or 0) > 0 else "LIQUIDITY_UNAVAILABLE",
                     "iv_data_status": "MEASURED" if c.greeks.iv is not None else "IV_UNAVAILABLE",
+                    "iv_context_status": self.factory.market_context.status,
+                    "iv_context_reason": self.factory.market_context.reason,
+                    "iv_context_source": self.factory.market_context.source,
+                    "iv_context_as_of": self.factory.market_context.as_of,
+                    "iv_context_expires_at": self.factory.market_context.expires_at,
                 })
                 proxy_score = 0.5 * c.trade_quality_score + 0.5 * proxies.opportunity_confidence_score
                 calibrated_probability, calibrated_expectancy, _ = self.calibration.outcome_calibration(
@@ -964,6 +1002,7 @@ class PaperRunner:
                     outcome.instrument_class, outcome.score, net_r, net,
                     instrument_id=outcome.underlying, paper=False,
                     observed_at=now,
+                    cost_model_valid=self._cost_model_valid,
                 )
                 self.event_ledger.append(
                     "SHADOW_OUTCOME", session_id=self.state.session_id,
@@ -1098,6 +1137,20 @@ class PaperRunner:
             allowed_playbooks = set().union(*self._playbook_codes_by_underlying.values()) if self._playbook_codes_by_underlying else set()
         result = self.scorer_engine.evaluate_and_select(candidates, state=state, allowed_playbooks=allowed_playbooks)
         self._record_gate_observations(result.evaluations, now)
+        if result.decision == TradeDecision.NO_TRADE and any("ambiguous" in str(reason).lower() for reason in result.reasons):
+            tie_payload = {
+                "status": "UNRESOLVED",
+                "reason": "Top candidates remained numerically identical after deterministic tie-break criteria",
+                "candidate_count": len(result.evaluations),
+                "timestamp": now.isoformat(),
+            }
+            self.state.underlyings["_rank_tie"] = tie_payload
+            self.event_ledger.append(
+                "RANK_TIE_UNRESOLVED", session_id=self.state.session_id,
+                decision_source="ranking_tie_breaker", ts=now, payload=tie_payload,
+            )
+        else:
+            self.state.underlyings.pop("_rank_tie", None)
         portfolio_snapshot = self._portfolio_no_trade_snapshot(result.evaluations, now)
         no_a_grade_required = bool(self.config.section("portfolio_no_trade_engine").get("no_trade_if_no_candidate_grade_at_least_A", True))
         if no_a_grade_required and (result.selected is None or result.selected.grade.value not in {"A", "A+"}):
@@ -1490,6 +1543,7 @@ class PaperRunner:
                 r_multiple, net, instrument_id=c.instrument.underlying, paper=True,
                 features=self._gate_feature_snapshot(pos.trade.entry_evaluation),
                 observed_at=result.trade.exit_time or now_ist(),
+                cost_model_valid=self._cost_model_valid,
             )
             self.event_ledger.append(
                 "PAPER_OUTCOME", session_id=self.state.session_id,
@@ -1642,6 +1696,7 @@ class PaperRunner:
             "capital": self.base_config.section("capital")["starting_capital"],
             "paper_overrides_active": bool(self._active_overrides),
             "active_overrides": self._active_overrides,
+            "daily_mode": dict(self.state.underlyings.get("_daily_mode", {})),
             "strategy_version": self.versions.strategy_version,
             "score_version": self.versions.score_version,
             "universe_version": self.versions.universe_version,
@@ -1684,6 +1739,54 @@ class PaperRunner:
             ])
 
     # -- helpers ---------------------------------------------------------------------
+
+    def _computed_daily_mode(self) -> str:
+        global_state = str(self._risk_context.get("global_risk_state", "NEUTRAL")).upper()
+        news_state = str(self._risk_context.get("news_state", "NEWS_NORMAL")).upper()
+        if global_state == "SHOCK" or news_state == "NEWS_NO_TRADE":
+            return "SURVIVAL"
+        if global_state == "RISK_OFF" or news_state == "NEWS_CAUTION":
+            return "DEFENSIVE"
+        return "NORMAL"
+
+    def _refresh_daily_controls(self, now: datetime) -> None:
+        """Reload operator controls before every cycle and propagate them to all consumers."""
+        computed_mode = self._computed_daily_mode()
+        daily_mode = load_daily_mode(self._daily_mode_path, computed_mode, now=now)
+        market_context = load_market_context(self._market_context_path, now=now)
+        previous_mode = getattr(self, "daily_mode", None)
+        previous_context = getattr(self.factory, "market_context", None)
+        self.daily_mode = daily_mode
+        self.scorer_engine.set_runtime_mode(daily_mode.effective_mode)
+        self.factory.market_context = market_context
+        self.signal.market_context = market_context
+        self.state.underlyings["_daily_mode"] = {
+            "computed_mode": daily_mode.computed_mode,
+            "effective_mode": daily_mode.effective_mode,
+            "status": daily_mode.status,
+            "reason": daily_mode.reason,
+            "path": daily_mode.path,
+        }
+        self.state.underlyings["_market_context"] = {
+            "status": market_context.status,
+            "reason": market_context.reason,
+            "path": market_context.path,
+            "as_of": market_context.as_of,
+            "expires_at": market_context.expires_at,
+            "source": market_context.source,
+        }
+        if previous_mode != daily_mode:
+            self.event_ledger.append(
+                "DAILY_MODE_CONTEXT", session_id=self.state.session_id,
+                decision_source="daily_mode_operator_control", ts=now,
+                payload=self.state.underlyings["_daily_mode"],
+            )
+        if previous_context != market_context:
+            self.event_ledger.append(
+                "MARKET_CONTEXT", session_id=self.state.session_id,
+                decision_source="daily_market_context_operator_control", ts=now,
+                payload=self.state.underlyings["_market_context"],
+            )
 
     def _load_risk_context(self) -> dict[str, Any]:
         controls = self.config.raw.get("runtime_risk_controls", {}) if hasattr(self, "config") else self.base_config.raw.get("runtime_risk_controls", {})

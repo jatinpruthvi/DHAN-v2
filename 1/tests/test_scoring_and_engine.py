@@ -111,6 +111,12 @@ class ScoringEngineTests(unittest.TestCase):
         self.assertEqual(result.decision, TradeDecision.BUY_CALL_CANDIDATE)
         self.assertEqual(result.selected.candidate.instrument.underlying, "NIFTY")
 
+    def test_unresolved_tie_is_explicit_no_trade(self):
+        engine = PaperOpportunityEngine(self.cfg)
+        result = engine.evaluate_and_select([candidate("NIFTY", 90), candidate("BANKNIFTY", 90)])
+        self.assertEqual(result.decision, TradeDecision.NO_TRADE)
+        self.assertTrue(any("ambiguous" in reason.lower() for reason in result.reasons))
+
     def test_global_position_lock_blocks(self):
         engine = PaperOpportunityEngine(self.cfg)
         result = engine.evaluate_and_select([candidate()], PaperPortfolioState(open_positions_count=1))
@@ -133,6 +139,20 @@ class ScoringEngineTests(unittest.TestCase):
             evaluation = scorer.evaluate(replace(candidate(), **{field: boundary}))
             self.assertFalse(evaluation.eligible, field)
             self.assertTrue(any(reason in item for item in evaluation.reasons), (field, evaluation.reasons))
+
+    def test_zero_quote_depth_is_data_invalid(self):
+        health = DataHealthOrchestrator(self.cfg)
+        stale_depth = replace(candidate(), quote=Quote(100, 100.5, 0, 1000, 100.25, datetime(2026, 6, 1, 10, 0)))
+        result = health.evaluate_candidate(stale_depth, datetime(2026, 6, 1, 10, 0, 1))
+        self.assertFalse(result.valid)
+        self.assertIn("depth", result.reason.lower())
+
+    def test_survival_daily_mode_blocks_new_risk(self):
+        scorer = OpportunityScorer(self.cfg)
+        scorer.set_runtime_mode("SURVIVAL")
+        evaluation = scorer.evaluate(candidate())
+        self.assertFalse(evaluation.risk_plan.hard_stop_fit)
+        self.assertEqual(evaluation.risk_plan.max_allowed_risk, 0.0)
 
     def test_explicit_playbook_grade_is_used_for_risk_provenance(self):
         evaluation = OpportunityScorer(self.cfg).evaluate(replace(candidate(), setup_grade="A"))

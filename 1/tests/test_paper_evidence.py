@@ -152,6 +152,9 @@ class EvidenceCsvTests(unittest.TestCase):
         self.assertEqual(float(row["net_pnl_rupees"]), 95.0)
         self.assertEqual(row["mapping_validation_passed"], "False")
         self.assertEqual(row["tick_size_validation_passed"], "True")
+        self.assertIn(row["entry_revalidation_passed"], {"True", "False"})
+        self.assertNotIn("revalidation_passed", row)
+        self.assertEqual(row["cost_model_status"], "UNSPECIFIED")
         self.assertEqual(row["elasticity_status"], "PROXY_RESEARCH_NOT_OBSERVED")
         self.assertEqual(row["data_health_valid"], "True")
 
@@ -206,7 +209,9 @@ class EvidenceCsvTests(unittest.TestCase):
         self.assertEqual(rows[0]["date"], "2026-08-12")
         self.assertGreater(float(rows[0]["comparable_score"]), float(rows[1]["comparable_score"]))
         for key in ("grade", "eligible", "decision", "direction", "convexity", "execution",
-                    "confidence", "exp_req_ratio", "bid", "ask", "mid", "spread_pct", "reasons"):
+                    "confidence", "exp_req_ratio", "bid", "ask", "mid", "spread_pct", "reasons",
+                    "iv_context_status", "iv_context_reason", "iv_context_source",
+                    "cost_model_valid", "canonical_promotion_allowed"):
             self.assertIn(key, rows[0])
         self.assertIsInstance(rows[0]["reasons"], str)
         diagnostics = list(self._csv_rows(self.dir / "candidate_diagnostics.csv"))
@@ -214,7 +219,10 @@ class EvidenceCsvTests(unittest.TestCase):
         for key in ("side_direction_score", "direction_gate_passed",
                     "contract_quality_score", "contract_quality_gate_passed",
                     "gate_optimization_status", "gate_validation_observations",
-                    "gate_validation_retention", "rejection_count", "rejection_reasons"):
+                    "gate_validation_retention", "rejection_count", "rejection_reasons",
+                    "iv_context_status", "iv_context_reason", "iv_context_source",
+                    "cost_model_valid", "canonical_promotion_allowed"):
+
             self.assertIn(key, diagnostics[0])
         # The strong call is aligned and the weak PE is wrong-sided in this
         # fixture, so the diagnostics must make the distinction explicit.

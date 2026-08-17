@@ -70,6 +70,12 @@
     "require_chain_semantics_for_approval": true,
     "fail_closed_after_source_timestamp_unavailable": true
   },
+  "operator_controls": {
+    "daily_mode_path": "uploads/DAILY_MODE.txt",
+    "market_context_path": "uploads/DAILY_MARKET_CONTEXT.json",
+    "manual_mode_can_loosen": false,
+    "require_valid_market_context_for_canonical": false
+  },
   "liquidity": {
     "atm_spread_ideal_pct": 1.0,
     "atm_spread_acceptable_pct": 1.5,

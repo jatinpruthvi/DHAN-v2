@@ -48,6 +48,8 @@ class DataHealthOrchestrator:
         dh = self.config.section("data_health")
         if not candidate.quote.is_valid():
             return DataHealth(False, False, "Candidate option quote invalid")
+        if candidate.quote.bid_qty <= 0 or candidate.quote.ask_qty <= 0:
+            return DataHealth(False, False, "Candidate option quote depth unavailable")
         age = (now - candidate.quote.timestamp).total_seconds()
         if age > float(dh["option_quote_stale_invalid_sec"]):
             return DataHealth(False, False, f"Candidate option quote stale {age:.2f}s")
@@ -66,10 +68,26 @@ class DataHealthOrchestrator:
             report = OptionChainSemanticValidator.validate(chain, require_tradable_quotes=False)
         except Exception as exc:
             return DataHealth(False, False, f"Option chain semantic validation error: {type(exc).__name__}")
-        if bool(dh.get("require_chain_semantics_for_approval", False)) and not report.valid:
-            return DataHealth(False, False, "; ".join(report.errors) or "Option chain semantics invalid")
-        if report.warnings:
-            return DataHealth(True, True, "; ".join(report.warnings[:3]))
+        timestamp_errors: list[str] = []
+        zero_volume_warnings: list[str] = []
+        for strike in chain.strikes:
+            if strike.ce is not None and strike.pe is not None:
+                ce_timestamp = strike.ce.source_timestamp or strike.ce.quote.timestamp
+                pe_timestamp = strike.pe.source_timestamp or strike.pe.quote.timestamp
+                delta = abs((ce_timestamp - pe_timestamp).total_seconds())
+                if delta > 2.0:
+                    timestamp_errors.append(f"CE/PE timestamp delta {delta:.2f}s at {strike.strike}")
+            for leg_name, leg in (("CE", strike.ce), ("PE", strike.pe)):
+                if leg is not None and leg.volume <= 0:
+                    zero_volume_warnings.append(f"Zero volume {leg_name} at {strike.strike}")
+        if timestamp_errors:
+            return DataHealth(False, False, "; ".join(timestamp_errors[:3]))
+        semantic_errors = list(report.errors)
+        if bool(dh.get("require_chain_semantics_for_approval", False)) and semantic_errors:
+            return DataHealth(False, False, "; ".join(semantic_errors) or "Option chain semantics invalid")
+        warnings = list(report.warnings[:3]) + zero_volume_warnings[:3]
+        if warnings:
+            return DataHealth(True, True, "; ".join(warnings))
         return DataHealth(True, False, "")
 
     def evaluate_option_chain_semantics(self, snap: InstrumentMarketSnapshot) -> DataHealth:

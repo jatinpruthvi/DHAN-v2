@@ -24,6 +24,7 @@ from .config import SystemConfig
 from .direction_models import DirectionModelCalculator, LeadershipInput, MidcapDirectionInput
 from .edge_modules import AdvancedEdgeCalculator, EdgeInputs
 from .models import CalibrationStatus, Moneyness, OptionType
+from .operator_controls import load_market_context
 from .option_chain import OptionChainSnapshot
 from .scoring import clamp, linear_score
 
@@ -80,6 +81,8 @@ class PaperSignalCalculator:
     def __init__(self, config: SystemConfig, history_candles: Optional[list[list]] = None):
         self.config = config
         self.history_candles = history_candles or []  # Fyers history: [ts, o, h, l, c, vol]
+        context_path = config.raw.get("operator_controls", {}).get("market_context_path", "uploads/DAILY_MARKET_CONTEXT.json") if isinstance(config.raw.get("operator_controls", {}), Mapping) else "uploads/DAILY_MARKET_CONTEXT.json"
+        self.market_context = load_market_context(context_path)
 
     # -- underlying-level signals --------------------------------------------
 
@@ -384,9 +387,16 @@ class PaperSignalCalculator:
     def _iv_crush_estimate(self, ctx: LiveSignalContext, chain: OptionChainSnapshot) -> float:
         from .market_metrics import IVCrushRiskCalculator
         calc = IVCrushRiskCalculator(self.config)
-        return calc.calculate(None, event_risk=10, recent_iv_expansion_pct=0,
-                              iv_realized_spread_pct=0, term_structure_risk=15,
-                              dte=ctx.dte, skew_risk=15)
+        values = self.market_context.values
+        return calc.calculate(
+            None,
+            event_risk=values["event_risk"],
+            recent_iv_expansion_pct=values["recent_iv_expansion_pct"],
+            iv_realized_spread_pct=values["iv_realized_spread_pct"],
+            term_structure_risk=values["term_structure_risk"],
+            dte=ctx.dte,
+            skew_risk=values["skew_risk"],
+        )
 
     @staticmethod
     def _gamma_usefulness(moneyness: Moneyness, dte: float) -> float:

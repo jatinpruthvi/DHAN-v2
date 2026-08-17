@@ -28,6 +28,19 @@ class ConfigTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             SystemConfig(raw=raw).validate()
 
+    def test_missing_execution_section_is_rejected_as_required(self):
+        raw = json.loads(Path("uploads/PARAMETERS.json").read_text(encoding="utf-8"))
+        raw.pop("execution", None)
+        with self.assertRaisesRegex(ValueError, "Required config section missing: execution"):
+            SystemConfig(raw=raw).validate()
+
+    def test_invalid_operator_control_path_is_rejected(self):
+        raw = json.loads(Path("uploads/PARAMETERS.json").read_text(encoding="utf-8"))
+        raw["operator_controls"] = copy.deepcopy(raw["operator_controls"])
+        raw["operator_controls"]["daily_mode_path"] = ""
+        with self.assertRaises(ValueError):
+            SystemConfig(raw=raw).validate()
+
     def test_invalid_stale_alert_threshold_is_rejected(self):
         raw = json.loads(Path("uploads/PARAMETERS.json").read_text(encoding="utf-8"))
         raw["data_health"] = copy.deepcopy(raw["data_health"])

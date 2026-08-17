@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Iterable
+from typing import Iterable, Mapping
 
 from .config import SystemConfig
+from .operator_controls import load_market_context
 from .market_metrics import ExpectedMoveCalculator, IVCrushRiskCalculator, atm_straddle_implied_move
 from .models import CalibrationStatus, CandidateInputs, DataHealth, InstrumentSpec, Moneyness, OptionType
 from .option_chain import OptionChainSnapshot
@@ -39,6 +40,8 @@ class CandidateFactory:
         self.expected = ExpectedMoveCalculator(config)
         self.ivrisk = IVCrushRiskCalculator(config)
         self.required_stop = RequiredStopModel(config)
+        context_path = config.raw.get("operator_controls", {}).get("market_context_path", "uploads/DAILY_MARKET_CONTEXT.json") if isinstance(config.raw.get("operator_controls", {}), Mapping) else "uploads/DAILY_MARKET_CONTEXT.json"
+        self.market_context = load_market_context(context_path)
 
     def candidates_from_chain(self, chain: OptionChainSnapshot, option_expiry_date, lot_size: int, tick_size: float, ctx: CandidateFactoryContext) -> tuple[CandidateInputs, ...]:
         strikes = [s.strike for s in chain.strikes]
@@ -63,7 +66,16 @@ class CandidateFactory:
                     instrument_class=ctx.instrument_class or class_for_metadata(ctx.exchange, ctx.instrument_kind),
                 )
                 m = Moneyness.ATM if abs(strike - atm) < 1e-9 else (Moneyness.OTM if (opt == OptionType.CE and strike > atm) or (opt == OptionType.PE and strike < atm) else Moneyness.ITM)
-                iv_crush = self.ivrisk.calculate(leg.implied_volatility, event_risk=10, recent_iv_expansion_pct=0, iv_realized_spread_pct=0, term_structure_risk=15, dte=ctx.dte, skew_risk=15)
+                iv_values = self.market_context.values
+                iv_crush = self.ivrisk.calculate(
+                    leg.implied_volatility,
+                    event_risk=iv_values["event_risk"],
+                    recent_iv_expansion_pct=iv_values["recent_iv_expansion_pct"],
+                    iv_realized_spread_pct=iv_values["iv_realized_spread_pct"],
+                    term_structure_risk=iv_values["term_structure_risk"],
+                    dte=ctx.dte,
+                    skew_risk=iv_values["skew_risk"],
+                )
                 direction_score = ctx.instrument_direction_score if opt == OptionType.CE else -ctx.instrument_direction_score
                 out.append(CandidateInputs(
                     instrument=spec,

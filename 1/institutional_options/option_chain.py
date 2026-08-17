@@ -25,6 +25,7 @@ class OptionLeg:
     previous_volume: int
     average_price: Optional[float] = None
     previous_close_price: Optional[float] = None
+    source_timestamp: Optional[datetime] = None
 
     @property
     def oi_change(self) -> int:
@@ -83,6 +84,19 @@ def _i(value: Any, default: int = 0) -> int:
 
 
 def _leg(strike: float, option_type: OptionType, raw: Mapping[str, Any], timestamp: datetime) -> OptionLeg:
+    source_timestamp = timestamp
+    source_timestamp_available = False
+    for key in ("source_timestamp", "quote_timestamp", "timestamp"):
+        raw_value = raw.get(key)
+        if raw_value in (None, ""):
+            continue
+        try:
+            parsed = datetime.fromisoformat(str(raw_value).replace("Z", "+00:00"))
+            source_timestamp = parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+            source_timestamp_available = True
+            break
+        except (TypeError, ValueError):
+            continue
     greeks_raw = raw.get("greeks") or {}
     quote = Quote(
         bid=_f(raw.get("top_bid_price")),
@@ -91,6 +105,7 @@ def _leg(strike: float, option_type: OptionType, raw: Mapping[str, Any], timesta
         ask_qty=_i(raw.get("top_ask_quantity")),
         last=_f(raw.get("last_price")) if raw.get("last_price") is not None else None,
         timestamp=timestamp,
+        source_timestamp_available=source_timestamp_available,
     )
     greeks = Greeks(
         delta=_f(greeks_raw.get("delta")) if greeks_raw.get("delta") is not None else None,
@@ -112,6 +127,7 @@ def _leg(strike: float, option_type: OptionType, raw: Mapping[str, Any], timesta
         previous_volume=_i(raw.get("previous_volume")),
         average_price=_f(raw.get("average_price")) if raw.get("average_price") is not None else None,
         previous_close_price=_f(raw.get("previous_close_price")) if raw.get("previous_close_price") is not None else None,
+        source_timestamp=source_timestamp,
     )
 
 
