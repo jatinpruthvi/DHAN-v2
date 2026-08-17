@@ -195,7 +195,7 @@ class PaperRunner:
         self._cost_model_status = "COST_MODEL_VALIDATED" if self._cost_model_valid else "COST_MODEL_UNVALIDATED"
         self.state.underlyings["_cost_model"] = {
             "status": self._cost_model_status,
-            "canonical_promotion_allowed": self._cost_model_valid,
+            "canonical_promotion_allowed": self._canonical_promotion_allowed(),
             "reasons": list(charges_validation.reasons),
         }
 
@@ -837,7 +837,7 @@ class PaperRunner:
                     "mapping_status": str(self.config.raw.get("evidence_profiles", {}).get("mapping_status", "UNSPECIFIED")),
                     "cost_model_status": self._cost_model_status,
                     "cost_model_valid": self._cost_model_valid,
-                    "canonical_promotion_allowed": self._cost_model_valid,
+                    "canonical_promotion_allowed": self._canonical_promotion_allowed(),
                     "liquidity_data_status": "MEASURED" if c.quote.bid_qty > 0 and c.quote.ask_qty > 0 and (c.quote.cumulative_bid_qty_5depth or 0) > 0 and (c.quote.cumulative_ask_qty_5depth or 0) > 0 else "LIQUIDITY_UNAVAILABLE",
                     "iv_data_status": "MEASURED" if c.greeks.iv is not None else "IV_UNAVAILABLE",
                     "iv_context_status": self.factory.market_context.status,
@@ -1739,6 +1739,13 @@ class PaperRunner:
             ])
 
     # -- helpers ---------------------------------------------------------------------
+
+    def _canonical_promotion_allowed(self) -> bool:
+        if not self._cost_model_valid:
+            return False
+        controls = self.config.raw.get("operator_controls", {})
+        require_context = bool(controls.get("require_valid_market_context_for_canonical", False)) if isinstance(controls, Mapping) else False
+        return not require_context or getattr(self.factory.market_context, "status", "") == "APPLIED"
 
     def _computed_daily_mode(self) -> str:
         global_state = str(self._risk_context.get("global_risk_state", "NEUTRAL")).upper()

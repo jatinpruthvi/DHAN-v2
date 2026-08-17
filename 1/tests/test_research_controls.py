@@ -264,6 +264,7 @@ class ResearchControlTests(unittest.TestCase):
             store.record_outcome(cls, 80.0, 2.0, 100.0, instrument_id="NIFTY", paper=False, cost_model_valid=False)
             self.assertEqual(store.state["outcomes"][cls]["count"], 0)
             self.assertFalse(store.state["gate_learning"]["NIFTY"]["outcomes"][0]["cost_model_valid"])
+            self.assertEqual(store.instrument_metrics("NIFTY")["shadow_outcomes"], 0)
 
     def test_promotion_retires_materially_negative_shadow_state(self):
         with tempfile.TemporaryDirectory() as d:

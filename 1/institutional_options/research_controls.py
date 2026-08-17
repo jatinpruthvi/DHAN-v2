@@ -540,18 +540,19 @@ class InstrumentCalibrationStore:
                 "shadow_wins": 0, "shadow_sum_r": 0.0, "paper_trades": 0,
                 "paper_wins": 0, "paper_sum_r": 0.0, "max_drawdown_r": 0.0,
             })
-            field = "paper" if paper else "shadow"
-            inst[f"{field}_outcomes" if not paper else "paper_trades"] = int(inst.get(f"{field}_outcomes" if not paper else "paper_trades", 0)) + 1
-            inst[f"{field}_wins"] = int(inst.get(f"{field}_wins", 0)) + int(bool(success))
-            prior_sum_r = float(inst.get(f"{field}_sum_r", 0.0))
-            new_sum_r = prior_sum_r + float(r_multiple)
-            inst[f"{field}_sum_r"] = new_sum_r
-            if paper:
-                peak_r = max(float(inst.get("paper_peak_r", 0.0)), new_sum_r)
-                inst["paper_peak_r"] = peak_r
-                inst["max_drawdown_r"] = max(
-                    float(inst.get("max_drawdown_r", 0.0)), peak_r - new_sum_r
-                )
+            if cost_model_valid:
+                field = "paper" if paper else "shadow"
+                inst[f"{field}_outcomes" if not paper else "paper_trades"] = int(inst.get(f"{field}_outcomes" if not paper else "paper_trades", 0)) + 1
+                inst[f"{field}_wins"] = int(inst.get(f"{field}_wins", 0)) + int(bool(success))
+                prior_sum_r = float(inst.get(f"{field}_sum_r", 0.0))
+                new_sum_r = prior_sum_r + float(r_multiple)
+                inst[f"{field}_sum_r"] = new_sum_r
+                if paper:
+                    peak_r = max(float(inst.get("paper_peak_r", 0.0)), new_sum_r)
+                    inst["paper_peak_r"] = peak_r
+                    inst["max_drawdown_r"] = max(
+                        float(inst.get("max_drawdown_r", 0.0)), peak_r - new_sum_r
+                    )
         if instrument_id:
             self._refresh_optimizer(str(instrument_id), key)
         self._save()
