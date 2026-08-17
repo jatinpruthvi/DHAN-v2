@@ -21,6 +21,7 @@ from statistics import mean
 from typing import Mapping, Optional
 
 from .config import SystemConfig
+from .direction_models import DirectionModelCalculator, LeadershipInput, MidcapDirectionInput
 from .edge_modules import AdvancedEdgeCalculator, EdgeInputs
 from .models import CalibrationStatus, Moneyness, OptionType
 from .option_chain import OptionChainSnapshot
@@ -48,6 +49,10 @@ class LiveSignalContext:
     calibration_liquidity: CalibrationStatus
     trend_efficiency: float         # 0..100 (diagnostic)
     atr1: float                     # 1-min ATR in points (diagnostic)
+    direction_model_score: Optional[float] = None
+    direction_model_name: str = ""
+    direction_model_status: str = "UNAVAILABLE"
+    direction_model_disagreement: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -80,7 +85,8 @@ class PaperSignalCalculator:
 
     def compute_context(self, chain: OptionChainSnapshot, vix: Optional[float],
                         now: datetime | None = None,
-                        history_candles: Optional[list] = None) -> LiveSignalContext:
+                        history_candles: Optional[list] = None,
+                        direction_model_inputs: Optional[Mapping[str, list]] = None) -> LiveSignalContext:
         now = now or datetime.now(timezone.utc)
         spot = chain.underlying_price
         dte = max(0.0, self._dte(chain.expiry, now))
@@ -98,12 +104,19 @@ class PaperSignalCalculator:
         straddle = self._atm_straddle(chain)
         required = max(straddle * self._cfg_float("signal", "required_move_straddle_factor", 0.6), 1.0)
         cal_dir, cal_liq = self._calibration_status(chain.underlying)
+        model_score, model_name, model_status = self.shadow_direction_score(
+            chain.underlying, history, direction_model_inputs or {},
+        )
+        disagreement = abs(direction - model_score) if model_score is not None else None
+        active_direction = direction
+        if self._cfg_bool("direction_model_runtime", "use_model_for_trade", False) and model_score is not None:
+            active_direction = model_score
         return LiveSignalContext(
             underlying=chain.underlying,
             spot_price=spot,
             vix=vix,
             dte=dte,
-            direction_score=direction,
+            direction_score=active_direction,
             trade_quality_score=trade_quality,
             regime_confidence=regime_conf,
             market_hostility_score=hostility,
@@ -114,6 +127,10 @@ class PaperSignalCalculator:
             calibration_liquidity=cal_liq,
             trend_efficiency=trend_eff,
             atr1=atr1,
+            direction_model_score=model_score,
+            direction_model_name=model_name,
+            direction_model_status=model_status,
+            direction_model_disagreement=disagreement,
         )
 
     # -- per-candidate proxies -------------------------------------------------
@@ -161,6 +178,99 @@ class PaperSignalCalculator:
         except (ValueError, TypeError):
             return 0.0
         return (exp - now.date()).days
+
+    def _cfg_bool(self, section: str, key: str, default: bool) -> bool:
+        raw = self.config.raw.get(section)
+        if isinstance(raw, Mapping):
+            value = raw.get(key, default)
+            if isinstance(value, bool):
+                return value
+            return str(value).strip().lower() in {"1", "true", "yes", "y"}
+        return default
+
+    def shadow_direction_score(
+        self,
+        underlying: str,
+        primary_history: list,
+        component_histories: Mapping[str, list],
+    ) -> tuple[Optional[float], str, str]:
+        """Calculate the richer direction model for shadow comparison only.
+
+        Missing component histories fail closed to ``None``. The current proxy
+        remains the trade signal unless the explicit, disabled-by-default
+        ``use_model_for_trade`` switch is enabled after validation.
+        """
+        name = str(underlying or "").upper()
+        features = self._history_features(primary_history)
+        if features is None:
+            return None, name, "PRIMARY_HISTORY_INSUFFICIENT"
+        if name == "MIDCPNIFTY":
+            score = DirectionModelCalculator.midcap_direction_proxy(MidcapDirectionInput(
+                futures_vwap_structure_score=DirectionModelCalculator.vwap_state_score(
+                    features["last_price"], features["vwap"], features["vwap_slope"],
+                ),
+                trend_efficiency_score=features["trend_efficiency"],
+                premium_elasticity_directional_score=0.0,
+                broad_market_confirmation_score=0.0,
+            ))
+            return score, "midcap_direction_proxy", "PARTIAL_MIDCAP"
+        if name not in {"BANKNIFTY", "NIFTY", "FINNIFTY"}:
+            return None, name, "NOT_CONFIGURED"
+        cfg = self.config.raw.get("direction_model_runtime", {})
+        symbols = cfg.get("component_symbols", {}).get(name, []) if isinstance(cfg, Mapping) else []
+        if not symbols:
+            return None, name, "COMPONENTS_NOT_CONFIGURED"
+        weights = cfg.get("component_weights", {}).get(name, {}) if isinstance(cfg, Mapping) else {}
+        inputs: list[LeadershipInput] = []
+        for symbol in symbols:
+            history = component_histories.get(symbol)
+            item = self._history_features(history)
+            if item is None:
+                return None, name, f"MISSING_COMPONENT_HISTORY:{symbol}"
+            inputs.append(LeadershipInput(
+                symbol=symbol,
+                weight=float(weights.get(symbol, 1.0)) if isinstance(weights, Mapping) else 1.0,
+                last_price=item["last_price"],
+                vwap=item["vwap"],
+                vwap_slope=item["vwap_slope"],
+                stock_return_5m_pct=item["return_5m_pct"],
+                index_return_5m_pct=features["return_5m_pct"],
+                relative_volume=item["relative_volume"],
+            ))
+        calc = DirectionModelCalculator()
+        if name == "BANKNIFTY":
+            return calc.banknifty_fast_wbci(inputs), "banknifty_fast_wbci", "VALID"
+        if name == "FINNIFTY":
+            return calc.finnifty_leadership_proxy(inputs), "finnifty_leadership_proxy", "VALID"
+        return calc.nifty_leadership_proxy(inputs), "nifty_leadership_proxy", "VALID"
+
+    def _history_features(self, history: Optional[list]) -> Optional[dict[str, float | None]]:
+        if not isinstance(history, list) or len(history) < 10:
+            return None
+        rows = [row for row in history if isinstance(row, (list, tuple)) and len(row) >= 6]
+        if len(rows) < 10:
+            return None
+        closes = [float(row[4]) for row in rows[-20:]]
+        volumes = [float(row[5]) for row in rows[-20:]]
+        if not closes or closes[-1] <= 0:
+            return None
+        recent = rows[-5:]
+        prior = rows[-10:-5]
+        def vwap(items):
+            total_volume = sum(max(0.0, float(row[5])) for row in items)
+            return (sum(float(row[4]) * max(0.0, float(row[5])) for row in items) / total_volume
+                    if total_volume > 0 else sum(float(row[4]) for row in items) / len(items))
+        recent_vwap = vwap(recent)
+        prior_vwap = vwap(prior)
+        base = closes[-6] if closes[-6] else 0.0
+        return {
+            "last_price": closes[-1],
+            "vwap": recent_vwap,
+            "vwap_slope": recent_vwap - prior_vwap,
+            "return_5m_pct": ((closes[-1] - base) / base * 100.0) if base > 0 else 0.0,
+            "relative_volume": (sum(volumes[-5:]) / 5.0) / (sum(volumes[:-5]) / max(1, len(volumes[:-5]))) if sum(volumes[:-5]) > 0 else None,
+            "trend_efficiency": self._trend_signals(closes)[0],
+        }
 
     def _cfg_float(self, section: str, key: str, default: float) -> float:
         raw = self.config.raw.get("paper_runner")

@@ -270,19 +270,25 @@ class FyersRestClient:
 
     # -- symbol master ---------------------------------------------------------
 
-    def download_symbol_master(self, output_path: str | Path) -> Path:
+    def download_symbol_master(self, output_path: str | Path,
+                               exchange: str = "NSE") -> Path:
         out = Path(output_path)
         out.parent.mkdir(parents=True, exist_ok=True)
-        status, text = _req(SYMBOL_MASTER_URL, raw_text=True, timeout=120)
+        exchange = str(exchange or "NSE").upper()
+        if exchange not in {"NSE", "BSE"}:
+            raise FyersAPIError(f"Unsupported Fyers symbol-master exchange: {exchange}")
+        url = f"https://public.fyers.in/sym_details/{exchange}_FO.csv"
+        status, text = _req(url, raw_text=True, timeout=120)
         out.write_text(text, encoding="utf-8")
         return out
 
-    def fetch_symbol_master(self, output_path: str | Path, max_age_hours: float = 20.0) -> Path:
-        """Download the NSE_FO master once per day (it refreshes nightly)."""
+    def fetch_symbol_master(self, output_path: str | Path, max_age_hours: float = 20.0,
+                            exchange: str = "NSE") -> Path:
+        """Download an exchange's derivatives master once per day."""
         out = Path(output_path)
         if out.exists() and (time.time() - out.stat().st_mtime) < max_age_hours * 3600:
             return out
-        return self.download_symbol_master(out)
+        return self.download_symbol_master(out, exchange=exchange)
 
 
 @dataclass(frozen=True)
@@ -314,6 +320,7 @@ class FyersSymbolMaster:
     COL_EXPIRY_TS = 8
     COL_SYM = 9
     COL_UND = 13
+    DEFAULT_INDEX_UNDERLYINGS = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"}
 
     def __init__(self, instruments: list[FyersInstrument]):
         self.instruments = tuple(instruments)
@@ -324,17 +331,24 @@ class FyersSymbolMaster:
             self._by_und_expiry.setdefault((inst.underlying.upper(), inst.expiry_date), []).append(inst)
 
     @classmethod
-    def from_csv(cls, path: str | Path) -> "FyersSymbolMaster":
+    def from_csv(cls, path: str | Path,
+                 allowed_exchanges: Optional[set[str]] = None,
+                 allowed_underlyings: Optional[set[str]] = None) -> "FyersSymbolMaster":
         out: list[FyersInstrument] = []
+        exchanges = {str(x).upper() for x in (allowed_exchanges or {"NSE"})}
+        underlyings = ({str(x).upper() for x in allowed_underlyings}
+                       if allowed_underlyings is not None
+                       else set(cls.DEFAULT_INDEX_UNDERLYINGS))
         with Path(path).open("r", encoding="utf-8-sig", newline="") as f:
             for row in csv.reader(f):
                 if len(row) <= cls.COL_SYM:
                     continue
                 sym = row[cls.COL_SYM]
-                if not sym.startswith("NSE:"):
+                exchange = sym.split(":", 1)[0].upper() if ":" in sym else ""
+                if exchange not in exchanges:
                     continue
                 underlying = row[cls.COL_UND].strip().upper()
-                if underlying not in {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"}:
+                if underlyings is not None and underlying not in underlyings:
                     continue
                 try:
                     expiry_ts = int(float(row[cls.COL_EXPIRY_TS]))
@@ -347,6 +361,13 @@ class FyersSymbolMaster:
                 out.append(FyersInstrument(sym, row[0], underlying, expiry_date, expiry_ts,
                                            strike, opt, lot, tick))
         return cls(out)
+
+    @classmethod
+    def combine(cls, *masters: "FyersSymbolMaster") -> "FyersSymbolMaster":
+        instruments: list[FyersInstrument] = []
+        for master in masters:
+            instruments.extend(master.instruments)
+        return cls(instruments)
 
     @staticmethod
     def _parse_option_symbol(sym: str) -> tuple[Optional[float], Optional[str]]:

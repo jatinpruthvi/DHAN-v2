@@ -191,7 +191,15 @@ class DryRunValidator:
         else:
             lot_tick_errors = self._count_rule_text(final_rows, ["lot", "tick"])
         checks.append(CheckResult("wrong_lot_tick_calculations", lot_tick_errors == 0, lot_tick_errors, 0, "CRITICAL", "No wrong lot-size or tick-size calculations."))
-        reval_values = [r.get("entry_revalidation_passed", r.get("revalidation_passed")) for r in mtil.rows if r.get("entry_revalidation_passed", r.get("revalidation_passed")) not in (None, "")]
+        reval_values = []
+        for row in mtil.rows:
+            value = row.get("entry_revalidation_passed")
+            if value in (None, ""):
+                profile = f"{row.get('schema_version', '')} {row.get('parameter_profile', '')}".upper()
+                if "LEGACY" in profile:
+                    value = row.get("revalidation_passed")
+            if value not in (None, ""):
+                reval_values.append(value)
         reval_ok = bool(reval_values) and all(_parse_bool(v) for v in reval_values)
         checks.append(CheckResult("candidate_revalidation", reval_ok, f"{sum(_parse_bool(v) for v in reval_values)}/{len(reval_values)}", "all true", "CRITICAL", "Candidate revalidation recorded and passed."))
         paper_fill_active = any(str(r.get("paper_fill_model", "")).strip() for r in mtil.rows) or any(str(r.get("simulated_entry_fill", "")).strip() for r in mtil.rows) or any(str(r.get("entry_fill_price", "")).strip() for r in mtil.rows)

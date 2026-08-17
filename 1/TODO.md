@@ -460,3 +460,99 @@ Collect evidence.
 Validate edge.
 Only then consider capital deployment.
 ```
+
+
+---
+
+# Implementation Status Update — 2026-08-13
+
+The following paper-safe implementation items have now been completed and tested:
+
+```text
+SIDE_DIRECTION_SCORING
+  Direction credit is side-aware; wrong-side candidates are hard-rejected.
+
+ENTRY_WINDOW_CONTROL
+  New entries are allowed only from 09:30 through 14:14 IST.
+  Existing positions remain managed after the entry cutoff.
+
+CONTRACT_QUALITY_GATE
+  opportunity_selection.require_contract_quality_min is enforced by the scorer.
+
+CANDIDATE_DIAGNOSTICS
+  candidate_diagnostics.csv records side direction, contract quality,
+  rejection reasons, observed elasticity, and current IV-surface diagnostics.
+
+OBSERVED_POST_COST_ELASTICITY_SHADOW
+  Rolling bid/ask-aware option response is captured in shadow mode.
+  It is not yet a trade-approval gate pending calibration data.
+
+OPTION_SURFACE_DIAGNOSTICS_SHADOW
+  Current ATM IV, call-put IV skew, and wing IV observations are captured.
+  IV percentile, IV-versus-realized spread, and term structure remain deferred.
+```
+
+Validation after this update:
+
+```text
+python -m unittest discover -s tests
+89 tests passing
+```
+
+The following items remain evidence-gated and are not activated as trade gates:
+
+```text
+calibrated ExpectedValue_R probabilities
+walk-forward threshold optimization
+outright-option versus debit-spread selection
+MAE/MFE-based exit calibration from real closed paper trades
+verified broker/statutory charges
+live packet-gap, reconnect, and depth-freshness validation
+```
+
+Live execution remains disabled.
+
+
+## BSE Monitor-Only Expansion — 2026-08-14
+
+The attached Fyers verification confirmed live BSE SENSEX and BANKEX option-chain responses and BSE symbol-master rows. The paper runner now supports these exchanges without changing the frozen four-index trade universe:
+
+```text
+BSE:SENSEX-INDEX  -> SENSEX  -> monitor_only=true
+BSE:BANKEX-INDEX  -> BANKEX  -> monitor_only=true
+```
+
+Implemented safeguards:
+
+```text
+- Fyers NSE/BSE symbol-master URLs are selected from configured exchange metadata.
+- NSE_FO.csv and BSE_FO.csv are parsed and combined when both exchanges are configured.
+- BSE contracts are parsed using the same CE/PE symbol parser.
+- Monitor-only underlyings are fetched, captured, and shown in runner state/dashboard data.
+- Monitor-only underlyings are excluded from candidate construction, ranking, paper entry,
+  skipped-candidate evidence, and the one-position trading decision.
+- SystemConfig still requires exactly the frozen four eligible trade underlyings.
+- Live execution remains disabled.
+```
+
+Promotion remains evidence-gated: BSE indices must first pass quote freshness, bid/ask, depth, conservative fillability, expiry, lot/tick, and a separate paper-validation sample before any consideration for trade eligibility.
+
+
+## Index-Universe Policy Audit — 2026-08-14
+
+The index recommendations were applied as a research policy rather than as new trade permissions. The paper runner now monitors SENSEX, NIFTYNXT50, and NIFTYFPI. BANKEX was removed from the active monitor configuration because it duplicates the existing BANKNIFTY factor exposure and was explicitly marked for deferral. Sectoral and broad indices without a verified active option-contract and liquidity path remain excluded.
+
+A strategy-safety issue was also corrected. Candidate construction no longer falls back to a guessed lot size of 30 and tick size of 0.05 when the instrument master is missing or the chain expiry is invalid. The candidate is blocked and an instrument error is recorded instead. This prevents a future promoted index from being mis-sized because of missing contract metadata.
+
+Monitor-only observations are recorded in `paper_state/monitor_diagnostics.csv`, including exchange, spot, expiry, VIX, ATM bid/ask spreads, quote validity, option-leg counts, and available bid/ask quantities. These observations do not influence ranking or entry.
+
+
+## Broad Research Universe Expansion — 2026-08-14
+
+The paper runner now collects research data across every verified option-family currently present in the cached Fyers masters: NIFTY, BANKNIFTY, FINNIFTY, MIDCPNIFTY, NIFTYNXT50, NIFTYFPI, BSE SENSEX, BSE BANKEX, and BSE FOCIT. The official current NIFTY 50 constituent CSV was also used to add all 50 constituents as stock-option monitor instruments.
+
+The original four index instruments remain the only trade-enabled baseline. Every added index and stock is `monitor_only=true` and `trade_enabled=false`. Monitor-only names are collected in rotating batches of eight, while the four trade-enabled names are fetched every cycle. This starts collecting evidence early without overwhelming the broker endpoint or allowing an unvalidated stock/index to trade merely because it receives a high proxy score.
+
+Monitor-only candidates are built through the same candidate factory and scorer in shadow mode, but are written to separate `shadow_candidates.csv` and `shadow_candidate_diagnostics.csv` files and displayed under `_shadow_candidates` with `research_only=true`. They are never passed to the live paper-entry selector. Liquidity and quote observations remain in `monitor_diagnostics.csv`.
+
+The monthly-expiry preference bug was corrected: the runner now passes the parsed boolean preference to expiry selection rather than comparing a boolean with the string `"true"`. Missing lot size, tick size, or expiry metadata continues to block candidate construction instead of guessing contract metadata.

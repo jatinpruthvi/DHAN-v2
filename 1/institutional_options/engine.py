@@ -16,9 +16,9 @@ class PaperPortfolioState:
 
 
 class PaperOpportunityEngine:
-    def __init__(self, config: SystemConfig):
+    def __init__(self, config: SystemConfig, gate_provider=None):
         self.config = config
-        self.scorer = OpportunityScorer(config)
+        self.scorer = OpportunityScorer(config, gate_provider=gate_provider)
 
     def evaluate_and_select(self, candidates: Iterable, state: Optional[PaperPortfolioState] = None, allowed_playbooks: Optional[AbstractSet[str]] = None) -> SelectionResult:
         state = state or PaperPortfolioState()

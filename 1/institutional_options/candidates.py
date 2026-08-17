@@ -9,6 +9,7 @@ from .market_metrics import ExpectedMoveCalculator, IVCrushRiskCalculator, atm_s
 from .models import CalibrationStatus, CandidateInputs, DataHealth, InstrumentSpec, Moneyness, OptionType
 from .option_chain import OptionChainSnapshot
 from .risk import RequiredStopModel
+from .research_controls import class_for_metadata, exposure_group
 
 
 @dataclass(frozen=True)
@@ -25,6 +26,11 @@ class CandidateFactoryContext:
     dte: float
     calibration_direction: CalibrationStatus = CalibrationStatus.UNVALIDATED
     calibration_liquidity: CalibrationStatus = CalibrationStatus.UNVALIDATED
+    exchange: str = "NSE"
+    instrument_kind: str = "INDEX"
+    instrument_class: str = "NSE_INDEX"
+    lifecycle_state: str = "SHADOW"
+    data_health: DataHealth = DataHealth(False, False, "DataHealth not evaluated")
 
 
 class CandidateFactory:
@@ -48,7 +54,14 @@ class CandidateFactory:
         for strike in sorted_by_distance:
             for opt in (OptionType.CE, OptionType.PE):
                 leg = chain.leg_at(strike, opt)
-                spec = InstrumentSpec(chain.underlying, leg.security_id, "OPTIDX", option_expiry_date, lot_size, tick_size, strike, opt)
+                spec = InstrumentSpec(
+                    chain.underlying, leg.security_id,
+                    "OPTSTK" if ctx.instrument_kind.upper() in {"STOCK", "STOCK_OPTION"} else "OPTIDX",
+                    option_expiry_date, lot_size, tick_size, strike, opt,
+                    exchange=ctx.exchange,
+                    instrument_kind=ctx.instrument_kind,
+                    instrument_class=ctx.instrument_class or class_for_metadata(ctx.exchange, ctx.instrument_kind),
+                )
                 m = Moneyness.ATM if abs(strike - atm) < 1e-9 else (Moneyness.OTM if (opt == OptionType.CE and strike > atm) or (opt == OptionType.PE and strike < atm) else Moneyness.ITM)
                 iv_crush = self.ivrisk.calculate(leg.implied_volatility, event_risk=10, recent_iv_expansion_pct=0, iv_realized_spread_pct=0, term_structure_risk=15, dte=ctx.dte, skew_risk=15)
                 direction_score = ctx.instrument_direction_score if opt == OptionType.CE else -ctx.instrument_direction_score
@@ -57,7 +70,7 @@ class CandidateFactory:
                     quote=leg.quote,
                     moneyness=m,
                     greeks=leg.greeks,
-                    data_health=DataHealth(True),
+                    data_health=ctx.data_health,
                     futures_price=ctx.futures_price,
                     underlying_price=ctx.spot_price,
                     instrument_direction_score=direction_score,
@@ -78,5 +91,7 @@ class CandidateFactory:
                     candidate_created_at=now,
                     calibration_status_direction=ctx.calibration_direction,
                     calibration_status_liquidity=ctx.calibration_liquidity,
+                    lifecycle_state=ctx.lifecycle_state,
+                    exposure_group=exposure_group(chain.underlying, ctx.instrument_kind),
                 ))
         return tuple(out)

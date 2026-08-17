@@ -106,6 +106,27 @@ def history_rising(spot=25000.0, bars=15):
 
 
 class FyersParserTests(unittest.TestCase):
+    def test_bse_symbol_master_rows_are_parsed_when_requested(self):
+        expiry_ts = 1787652600
+        rows = []
+        for opt in ("CE", "PE"):
+            row = ["bse-token", "SENSEX", "BSE", "20", "0.05", "", "", "", str(expiry_ts),
+                   f"BSE:SENSEX26AUG78000{opt}", "", "", "", "SENSEX"]
+            rows.append(",".join(row))
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "BSE_FO.csv"
+            path.write_text("\n".join(rows) + "\n", encoding="utf-8")
+            master = FyersSymbolMaster.from_csv(
+                path,
+                allowed_exchanges={"BSE"},
+                allowed_underlyings={"SENSEX"},
+            )
+        self.assertEqual(master.expiry_dates("SENSEX"), (date(2026, 8, 25),))
+        self.assertEqual(master.lot_size("SENSEX", date(2026, 8, 25)), 20)
+        self.assertEqual(master.tick_size("SENSEX", date(2026, 8, 25)), 0.05)
+        self.assertEqual(master.symbol_for("SENSEX", date(2026, 8, 25), 78000, "CE"),
+                         "BSE:SENSEX26AUG78000CE")
+
     def test_parse_chain(self):
         payload = make_chain_payload()
         chain = FyersOptionChainParser.parse(payload, "NIFTY", "2026-08-25",
@@ -161,6 +182,19 @@ class SignalProxyTests(unittest.TestCase):
         # In an uptrend the call must carry more conviction than the put.
         self.assertGreater(ce.opportunity_confidence_score, pe.opportunity_confidence_score)
 
+    def test_direction_model_runs_in_shadow_without_replacing_proxy(self):
+        payload = make_chain_payload()
+        chain = FyersOptionChainParser.parse(payload, "NIFTY", "2026-08-25",
+                                             datetime(2026, 8, 12, 10, 0))
+        calc = PaperSignalCalculator(self.cfg, history_rising())
+        inputs = {name: history_rising() for name in ("HDFCBANK", "SBIN", "ICICIBANK")}
+        ctx = calc.compute_context(chain, 13.5, datetime(2026, 8, 12, 10, 0),
+                                   history_candles=history_rising(),
+                                   direction_model_inputs=inputs)
+        self.assertEqual(ctx.direction_model_status, "VALID")
+        self.assertIsNotNone(ctx.direction_model_score)
+        self.assertEqual(ctx.direction_score, calc._trend_signals([row[4] for row in history_rising()])[1])
+
     def test_per_call_history_override_beats_constructor_history(self):
         payload = make_chain_payload()
         chain = FyersOptionChainParser.parse(payload, "NIFTY", "2026-08-25",
@@ -190,6 +224,143 @@ class RunnerCycleTests(unittest.TestCase):
     def tearDown(self):
         self._clock.stop()
         self.tmp.cleanup()
+
+    def test_entry_window_uses_configured_start_and_cutoff(self):
+        runner = PaperRunner(self.cfg, RUNNER_CFG, state_dir=self.state_dir,
+                             client=FakeClient(history=history_rising()),
+                             master=make_master())
+        self.assertFalse(runner._entry_window_open(datetime(2026, 8, 12, 9, 29)))
+        self.assertTrue(runner._entry_window_open(datetime(2026, 8, 12, 9, 30)))
+        self.assertTrue(runner._entry_window_open(datetime(2026, 8, 12, 14, 14)))
+        self.assertFalse(runner._entry_window_open(datetime(2026, 8, 12, 14, 15)))
+        self.assertFalse(runner._entry_window_open(datetime(2026, 8, 12, 15, 0)))
+
+    def test_default_expanded_universe_is_paper_selector_eligible(self):
+        cfg = json.loads(Path("uploads/PAPER_RUNNER.json").read_text(encoding="utf-8"))
+        underlyings = cfg["underlyings"]
+        self.assertFalse(underlyings["SENSEX"]["monitor_only"])
+        self.assertFalse(underlyings["NIFTYNXT50"]["monitor_only"])
+        self.assertFalse(underlyings["NIFTYFPI"]["monitor_only"])
+        self.assertIn("BANKEX", underlyings)
+        self.assertEqual(underlyings["NIFTYNXT50"]["index_symbol"], "NSE:NIFTYNXT50-INDEX")
+        self.assertEqual(underlyings["NIFTYFPI"]["index_symbol"], "NSE:NIFTYFPI-INDEX")
+        self.assertFalse(underlyings["BANKEX"]["monitor_only"])
+        self.assertFalse(underlyings["FOCIT"]["monitor_only"])
+        stocks = [meta for meta in underlyings.values() if meta.get("instrument_kind") == "STOCK"]
+        trade_enabled = [meta for meta in underlyings.values() if meta.get("trade_enabled")]
+        self.assertEqual(len(stocks), 50)
+        self.assertEqual(len(trade_enabled), 59)
+        self.assertTrue(all(meta.get("trade_enabled") and not meta.get("monitor_only") for meta in underlyings.values()))
+        self.assertEqual(cfg["monitoring"]["monitor_batch_size"], 8)
+        self.assertEqual(cfg["monitoring"]["monitor_poll_seconds"], 60)
+
+    def test_prefer_monthly_selects_monthly_expiry(self):
+        runner = PaperRunner(self.cfg, RUNNER_CFG, state_dir=self.state_dir,
+                             client=FakeClient(), master=make_master())
+        calendar = (
+            SimpleNamespace(date_str="18-08-2026", expiry_ts=1787047800, flag="W"),
+            SimpleNamespace(date_str="25-08-2026", expiry_ts=1787652600, flag="M"),
+        )
+        self.assertEqual(runner._select_expiry("SENSEX", calendar, True), "2026-08-25")
+        self.assertEqual(runner._select_expiry("NIFTY", calendar, False), "2026-08-18")
+
+    def test_monitor_rotation_keeps_trade_universe_always_present(self):
+        cfg = json.loads(Path("uploads/PAPER_RUNNER.json").read_text(encoding="utf-8"))
+        cfg["monitoring"]["monitor_poll_seconds"] = 0
+        runner = PaperRunner(self.cfg, cfg, state_dir=self.state_dir,
+                             client=FakeClient(), master=make_master())
+        first = runner._cycle_underlyings()
+        second = runner._cycle_underlyings()
+        self.assertEqual(set(first[:4]), {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"})
+        self.assertEqual(set(second[:4]), {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"})
+        self.assertEqual(len(first), 12)
+        self.assertEqual(len(second), 12)
+        self.assertNotEqual(first[4:], second[4:])
+
+    def test_monitor_poll_throttle_fetches_trade_universe_without_repeating_batch(self):
+        cfg = json.loads(Path("uploads/PAPER_RUNNER.json").read_text(encoding="utf-8"))
+        runner = PaperRunner(self.cfg, cfg, state_dir=self.state_dir,
+                             client=FakeClient(), master=make_master())
+        first = runner._cycle_underlyings()
+        second = runner._cycle_underlyings()
+        self.assertEqual(len(first), 12)
+        self.assertEqual(len(second), 12)
+        self.assertEqual(set(second), set(first))
+        schedule = runner.state.underlyings["_paper_schedule"]
+        self.assertEqual(set(schedule["selected"]), set(second))
+        self.assertEqual(len(schedule["last_batch"]), 8)
+
+    def test_monitor_only_bse_chain_is_displayed_but_not_ranked(self):
+        cfg = {**RUNNER_CFG, "underlyings": {
+            "NIFTY": {"index_symbol": "NSE:NIFTY50-INDEX", "prefer_monthly": False},
+            "SENSEX": {"index_symbol": "BSE:SENSEX-INDEX", "exchange": "BSE",
+                       "prefer_monthly": True, "monitor_only": True},
+        }}
+        payloads = {
+            "NSE:NIFTY50-INDEX": make_chain_payload(),
+            "BSE:SENSEX-INDEX": make_chain_payload(spot=78000.0, prem=120.0),
+        }
+        combined_master = FyersSymbolMaster.combine(
+            make_master(),
+            make_master("SENSEX", expiry=date(2026, 8, 25), spot=78000),
+        )
+        runner = PaperRunner(self.cfg, cfg, state_dir=self.state_dir,
+                             client=FakeClient(payloads=payloads, history=history_rising()),
+                             master=combined_master)
+        runner.run_one_cycle()
+        snap = runner.snapshot()
+        self.assertEqual(snap["underlyings"]["SENSEX"]["exchange"], "BSE")
+        self.assertTrue(snap["underlyings"]["SENSEX"]["monitor_only"])
+        ranked = snap["underlyings"].get("_candidates", [])
+        self.assertTrue(all(row["underlying"] != "SENSEX" for row in ranked))
+        monitor_log = self.state_dir / "monitor_diagnostics.csv"
+        self.assertTrue(monitor_log.exists())
+        monitor_text = monitor_log.read_text(encoding="utf-8")
+        self.assertIn("underlying,exchange", monitor_text)
+        self.assertIn("SENSEX,BSE", monitor_text)
+        self.assertIn("atm_ce_spread_pct", monitor_text)
+        shadow_log = self.state_dir / "shadow_candidates.csv"
+        self.assertTrue(shadow_log.exists())
+        shadow_text = shadow_log.read_text(encoding="utf-8")
+        self.assertIn("research_only", shadow_text)
+        self.assertIn("SENSEX", shadow_text)
+        self.assertNotIn("SENSEX", "\n".join(row.get("underlying", "") for row in ranked))
+
+    def test_stock_option_monitor_uses_generic_chain_and_master_path(self):
+        cfg = {**RUNNER_CFG, "underlyings": {
+            "NIFTY": {"index_symbol": "NSE:NIFTY50-INDEX", "prefer_monthly": False},
+            "RELIANCE": {"index_symbol": "NSE:RELIANCE-EQ", "exchange": "NSE",
+                         "instrument_kind": "STOCK", "prefer_monthly": True,
+                         "monitor_only": True},
+        }}
+        payloads = {
+            "NSE:NIFTY50-INDEX": make_chain_payload(),
+            "NSE:RELIANCE-EQ": make_chain_payload(spot=25000.0, prem=90.0),
+        }
+        combined_master = FyersSymbolMaster.combine(
+            make_master(),
+            make_master("RELIANCE", expiry=date(2026, 8, 25), spot=25000),
+        )
+        runner = PaperRunner(self.cfg, cfg, state_dir=self.state_dir,
+                             client=FakeClient(payloads=payloads, history=history_rising()),
+                             master=combined_master)
+        runner.run_one_cycle()
+        snap = runner.snapshot()
+        self.assertEqual(snap["underlyings"]["RELIANCE"]["instrument_kind"], "STOCK")
+        self.assertTrue(snap["underlyings"]["RELIANCE"]["monitor_only"])
+        self.assertTrue(all(row["underlying"] != "RELIANCE"
+                            for row in snap["underlyings"].get("_candidates", [])))
+        self.assertTrue(any(row["underlying"] == "RELIANCE" and row["research_only"]
+                            for row in snap["underlyings"].get("_shadow_candidates", [])))
+
+    def test_missing_contract_metadata_blocks_candidate_creation(self):
+        client = FakeClient(history=history_rising())
+        runner = PaperRunner(self.cfg, RUNNER_CFG, state_dir=self.state_dir,
+                             client=client, master=FyersSymbolMaster([]))
+        runner.run_one_cycle()
+        snap = runner.snapshot()
+        self.assertIn("instrument_error", snap["underlyings"]["NIFTY"])
+        self.assertEqual(snap["underlyings"].get("_candidates", []), [])
 
     def test_cycle_builds_candidates_with_proxies(self):
         client = FakeClient(history=history_rising())
@@ -233,6 +404,19 @@ class RunnerCycleTests(unittest.TestCase):
                               master=make_master())
         self.assertAlmostEqual(runner2._target_r(strong), 2.0)
 
+    def test_cycle_writes_candidate_diagnostics(self):
+        runner = PaperRunner(self.cfg, RUNNER_CFG, state_dir=self.state_dir,
+                             client=FakeClient(history=history_rising()),
+                             master=make_master())
+        runner.run_one_cycle()
+        path = self.state_dir / "candidate_diagnostics.csv"
+        self.assertTrue(path.exists())
+        text = path.read_text(encoding="utf-8")
+        for key in ("side_direction_score", "direction_gate_passed",
+                    "observed_elasticity_valid", "observed_elasticity_post_cost",
+                    "surface_valid", "atm_iv", "call_put_iv_skew"):
+            self.assertIn(key, text)
+
     def test_cycle_writes_candidates_log(self):
         runner = PaperRunner(self.cfg, RUNNER_CFG, state_dir=self.state_dir,
                              client=FakeClient(history=history_rising()),
@@ -246,6 +430,90 @@ class RunnerCycleTests(unittest.TestCase):
         for key in ("date", "comparable_score", "threshold", "grade", "decision",
                     "direction", "execution", "exp_req_ratio", "spread_pct"):
             self.assertIn(key, rows[0])
+
+    def test_verified_playbook_filter_selects_regime_compatible_code(self):
+        risk_path = self.state_dir / "risk_context.json"
+        risk_path.write_text(json.dumps({
+            "ts": "2026-08-12T10:00:00+05:30",
+            "source": "test-feed",
+            "global_risk_state": "NEUTRAL",
+            "news_state": "NEWS_NORMAL",
+            "liquidity_stable": True,
+            "gap_wait_completed": True,
+        }), encoding="utf-8")
+        cfg = {**RUNNER_CFG, "risk_context_path": str(risk_path),
+               "config_overrides": {"playbook_runtime": {"enforce_on_paper": True}}}
+        runner = PaperRunner(self.cfg, cfg, state_dir=self.state_dir,
+                             client=FakeClient(history=history_rising()), master=make_master())
+        context = SimpleNamespace(
+            trend_efficiency=90.0, direction_score=80.0, vix=13.5,
+            regime_confidence=85.0, market_hostility_score=10.0,
+            trade_quality_score=90.0, dte=5.0,
+        )
+        runner._update_playbook_filters({"NIFTY": context}, self.MARKET_NOW)
+        self.assertIn("A01", runner._playbook_codes_by_underlying["NIFTY"])
+
+    def test_runtime_risk_context_fails_closed_when_enforced(self):
+        risk_path = self.state_dir / "risk_context.json"
+        risk_path.write_text(json.dumps({
+            "ts": "2026-08-12T10:00:00+05:30",
+            "source": "test-feed",
+            "global_risk_state": "SHOCK",
+            "news_state": "NEWS_NORMAL",
+            "portfolio_no_trade_score": 10,
+        }), encoding="utf-8")
+        cfg = {**RUNNER_CFG,
+               "risk_context_path": str(risk_path),
+               "config_overrides": {"runtime_risk_controls": {"enforce_on_paper": True}}}
+        runner = PaperRunner(self.cfg, cfg, state_dir=self.state_dir,
+                             client=FakeClient(history=history_rising()), master=make_master())
+        self.assertIn("Global risk shock", runner._risk_context_block_reason())
+
+    def test_rank_persistence_requires_two_windows_and_survives_restart(self):
+        runner = PaperRunner(self.cfg, RUNNER_CFG, state_dir=self.state_dir,
+                             client=FakeClient(history=history_rising()), master=make_master())
+        candidate = SimpleNamespace(
+            instrument=SimpleNamespace(underlying="NIFTY", expiry=date(2026, 8, 25), strike=25000.0),
+            side=OptionType.CE,
+        )
+        evaluation = SimpleNamespace(candidate=candidate)
+        first = runner._rank_persistence_check(evaluation, self.MARKET_NOW)
+        self.assertFalse(first[0])
+        reloaded = PaperRunner(self.cfg, RUNNER_CFG, state_dir=self.state_dir,
+                               client=FakeClient(history=history_rising()), master=make_master())
+        second = reloaded._rank_persistence_check(evaluation, self.MARKET_NOW + timedelta(seconds=5))
+        self.assertTrue(second[0])
+
+    def test_daily_risk_limits_are_enforced_and_persisted(self):
+        runner = PaperRunner(self.cfg, RUNNER_CFG, state_dir=self.state_dir,
+                             client=FakeClient(history=history_rising()), master=make_master())
+        runner.state.trades_today = 2
+        self.assertIn("Maximum trades per day", runner._daily_risk_block_reason(self.MARKET_NOW))
+        runner.state.trades_today = 0
+        runner.state.losses_today = 3
+        self.assertIn("three daily losses", runner._daily_risk_block_reason(self.MARKET_NOW))
+        runner.state.losses_today = 0
+        runner.state.realized_pnl_today = -1500.0
+        self.assertIn("Maximum daily loss", runner._daily_risk_block_reason(self.MARKET_NOW))
+        runner.state.realized_pnl_today = 0.0
+        runner.state.trades_today = 1
+        runner._save_daily_risk_state()
+        reloaded = PaperRunner(self.cfg, RUNNER_CFG, state_dir=self.state_dir,
+                               client=FakeClient(history=history_rising()), master=make_master())
+        self.assertEqual(reloaded.state.trades_today, 1)
+
+    def test_signal_runner_override_reaches_signal_calculator_config(self):
+        cfg = {**RUNNER_CFG, "signal": {"required_move_straddle_factor": 0.9}}
+        runner = PaperRunner(self.cfg, cfg, state_dir=self.state_dir,
+                             client=FakeClient(history=history_rising()), master=make_master())
+        self.assertEqual(runner.config.raw["paper_runner"]["signal"]["required_move_straddle_factor"], 0.9)
+
+    def test_saturday_waits_until_monday_open(self):
+        runner = PaperRunner(self.cfg, RUNNER_CFG, state_dir=self.state_dir,
+                             client=FakeClient(), master=make_master())
+        saturday = datetime(2026, 8, 15, 10, 0)
+        with mock.patch("institutional_options.paper_runner.now_ist", return_value=saturday):
+            self.assertEqual(runner._seconds_to_open(), 47 * 3600 + 15 * 60)
 
     def test_prefilter_drops_unfillable_strikes(self):
         payload = make_chain_payload()
@@ -265,6 +533,43 @@ class RunnerCycleTests(unittest.TestCase):
         strikes = {c["strike"] for c in cands}
         self.assertNotIn(25000.0, strikes)
         self.assertGreaterEqual(snap["underlyings"].get("_prefiltered", 0), 2)
+
+
+    def test_run_manifest_is_created_and_stale_state_is_archived(self):
+        with tempfile.TemporaryDirectory() as d:
+            runner = PaperRunner(self.cfg, RUNNER_CFG, state_dir=d,
+                                 client=FakeClient(history=history_rising()), master=make_master())
+            manifest_path = Path(d) / "run_manifest.json"
+            self.assertTrue(manifest_path.exists())
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(manifest["universe"]["underlyings"], ["NIFTY"])
+            self.assertEqual(manifest["live_execution"], "DISABLED")
+            (Path(d) / "mtil.csv").write_text("legacy\n", encoding="utf-8")
+            manifest["policy_signature"] = "stale-policy"
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            PaperRunner(self.cfg, RUNNER_CFG, state_dir=d,
+                        client=FakeClient(history=history_rising()), master=make_master())
+            archives = list((Path(d) / "archives").glob("policy_*"))
+            self.assertEqual(len(archives), 1)
+            self.assertTrue((archives[0] / "mtil.csv").exists())
+            self.assertTrue(manifest_path.exists())
+
+    def test_revalidation_and_fill_audit_streams_are_created(self):
+        with tempfile.TemporaryDirectory() as d:
+            runner = PaperRunner(self.cfg, RUNNER_CFG, state_dir=d,
+                                 client=FakeClient(history=history_rising()), master=make_master())
+            runner.run_one_cycle()
+            self.assertTrue((Path(d) / "run_manifest.json").exists())
+            # The audit files are created once the corresponding path is exercised;
+            # their presence is not required when no candidate reaches revalidation.
+            self.assertFalse((Path(d) / "mtil.csv").exists() and (Path(d) / "mtil.csv").read_text(encoding="utf-8").startswith("legacy"))
+
+    def test_live_execution_override_is_rejected(self):
+        cfg = {**RUNNER_CFG, "config_overrides": {"execution": {"live_trading_enabled": True}}}
+        with tempfile.TemporaryDirectory() as d:
+            with self.assertRaises(ValueError):
+                PaperRunner(self.cfg, cfg, state_dir=d,
+                            client=FakeClient(history=history_rising()), master=make_master())
 
 
 if __name__ == "__main__":

@@ -78,18 +78,12 @@ def main() -> int:
     ap.add_argument("--state-dir", default="paper_state")
     ap.add_argument("--skip-tests", action="store_true",
                     help="Skip the test-suite step (marks emergency tests as NOT passed)")
-    ap.add_argument("--assume-tests-passed", action="store_true",
-                    help="Mark emergency_tests_passed=True without running tests "
-                         "(only use if tests were run separately and are green)")
     args = ap.parse_args()
 
     state_dir = Path(args.state_dir)
     state_dir.mkdir(parents=True, exist_ok=True)
 
-    if args.assume_tests_passed:
-        tests_ok = True
-        print("[daily] assuming test suite passed (--assume-tests-passed)", flush=True)
-    elif args.skip_tests:
+    if args.skip_tests:
         tests_ok = False
         print("[daily] skipping test suite (--skip-tests); emergency gate = FAIL", flush=True)
     else:

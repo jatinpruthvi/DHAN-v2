@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, date
 from enum import Enum
-from typing import Mapping, Optional
+from typing import Any, Mapping, Optional
 
 
 class OptionType(str, Enum):
@@ -63,6 +63,9 @@ class InstrumentSpec:
     option_type: Optional[OptionType] = None
     freeze_qty: Optional[int] = None
     buy_sell_allowed: bool = True
+    exchange: str = "NSE"
+    instrument_kind: str = "INDEX"
+    instrument_class: str = "NSE_INDEX"
 
 
 @dataclass(frozen=True)
@@ -75,6 +78,7 @@ class Quote:
     timestamp: datetime
     cumulative_bid_qty_5depth: Optional[int] = None
     cumulative_ask_qty_5depth: Optional[int] = None
+    source_timestamp_available: bool = False
 
     @property
     def mid(self) -> float:
@@ -142,7 +146,11 @@ class CandidateInputs:
     setup_type: str = "UNKNOWN"
     calibration_status_direction: CalibrationStatus = CalibrationStatus.UNVALIDATED
     calibration_status_liquidity: CalibrationStatus = CalibrationStatus.UNVALIDATED
-    notes: Mapping[str, str] = field(default_factory=dict)
+    notes: Mapping[str, Any] = field(default_factory=dict)
+    calibrated_success_probability: Optional[float] = None
+    calibrated_net_expectancy_r: Optional[float] = None
+    lifecycle_state: str = "SHADOW"
+    exposure_group: str = ""
 
     @property
     def side(self) -> OptionType:

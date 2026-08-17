@@ -64,7 +64,10 @@
     "packet_gap_freeze_sec": 10,
     "reconnect_stable_wait_sec": 30,
     "repeated_api_error_window_min": 5,
-    "repeated_api_error_count_no_trade": 2
+    "repeated_api_error_count_no_trade": 2,
+    "require_source_timestamp_for_approval": true,
+    "require_chain_semantics_for_approval": true,
+    "fail_closed_after_source_timestamp_unavailable": true
   },
   "liquidity": {
     "atm_spread_ideal_pct": 1.0,
@@ -207,6 +210,7 @@
     "normal_average_min": 15,
     "normal_average_max": 20,
     "normal_max_hold_minutes": 30,
+    "no_new_entries_after": "14:15",
     "extended_max_hold_minutes": 45,
     "exceptional_trend_max_minutes": 90,
     "losing_normal_max_minutes": 12,
@@ -249,12 +253,22 @@
     "minimum_occurrences_per_condition": 20
   },
   "instrument_universe": {
-    "phase": "PHASE_1_MULTI_INSTRUMENT_SELECTION",
+    "phase": "PHASE_1_ALL_59_PAPER_SELECTION",
+    "paper_trade_all_configured_underlyings": true,
+    "live_trade_universe_remains_frozen_four": true,
     "eligible_underlyings": [
-      "BANKNIFTY",
-      "NIFTY",
-      "FINNIFTY",
-      "MIDCPNIFTY"
+      "BANKNIFTY", "NIFTY", "FINNIFTY", "MIDCPNIFTY",
+      "SENSEX", "BANKEX", "FOCIT", "NIFTYNXT50", "NIFTYFPI",
+      "ADANIENT", "ADANIPORTS", "APOLLOHOSP", "ASIANPAINT", "AXISBANK",
+      "BAJAJ-AUTO", "BAJFINANCE", "BAJAJFINSV", "BEL", "BHARTIARTL",
+      "CIPLA", "COALINDIA", "DRREDDY", "EICHERMOT", "ETERNAL",
+      "GRASIM", "HCLTECH", "HDFCBANK", "HDFCLIFE", "HINDALCO",
+      "HINDUNILVR", "ICICIBANK", "ITC", "INFY", "INDIGO",
+      "JSWSTEEL", "JIOFIN", "KOTAKBANK", "LT", "M&M",
+      "MARUTI", "MAXHEALTH", "NTPC", "NESTLEIND", "ONGC",
+      "POWERGRID", "RELIANCE", "SBILIFE", "SHRIRAMFIN", "SBIN",
+      "SUNPHARMA", "TCS", "TATACONSUM", "TMPV", "TATASTEEL",
+      "TECHM", "TITAN", "TRENT", "ULTRACEMCO", "WIPRO"
     ],
     "trade_only_best_ranked_candidate": true,
     "max_open_positions": 1,
@@ -300,6 +314,13 @@
     },
     "rank_tie_threshold_points": 3,
     "ambiguous_after_tie_break_means_no_trade": true,
+    "excellent_gate_requirements": {
+      "execution_quality_min": 80,
+      "convexity_edge_min": 80,
+      "opportunity_confidence_min": 70,
+      "regime_fit_min": 70,
+      "required_stop_must_be_configured": true
+    },
     "rank_persistence_required_windows": 2,
     "a_plus_impulse_exception_allowed": true
   },
@@ -344,6 +365,22 @@
       "FINNIFTY": 10,
       "MIDCPNIFTY": 15
     }
+  },
+  "direction_model_runtime": {
+    "shadow_enabled": true,
+    "use_model_for_trade": false,
+    "minimum_component_history_bars": 10,
+    "component_symbols": {
+      "BANKNIFTY": ["HDFCBANK", "SBIN", "ICICIBANK"],
+      "NIFTY": ["HDFCBANK", "SBIN", "ICICIBANK"],
+      "FINNIFTY": ["HDFCBANK", "SBIN", "ICICIBANK"]
+    },
+    "component_weights": {
+      "BANKNIFTY": {"HDFCBANK": 0.393, "SBIN": 0.305, "ICICIBANK": 0.302},
+      "NIFTY": {"HDFCBANK": 0.333333, "SBIN": 0.333333, "ICICIBANK": 0.333334},
+      "FINNIFTY": {"HDFCBANK": 0.333333, "SBIN": 0.333333, "ICICIBANK": 0.333334}
+    },
+    "rationale": "Direction models run in shadow mode until constituent data quality, model agreement, and out-of-sample calibration are validated. Missing component history returns UNAVAILABLE and never substitutes guessed values."
   },
   "per_instrument_risk_handling": {
     "lot_size_source": "DHAN_DETAILED_INSTRUMENT_MASTER_RUNTIME",
@@ -414,6 +451,64 @@
     "paper_fill_simulator_must_be_active": true,
     "emergency_tests_must_pass": true,
     "live_trading_allowed_if_any_critical_fail": false
+  },
+  "instrument_class_profiles": {
+    "NSE_INDEX": {
+      "contract_quality_min": 80,
+      "min_top_book_lots": 2,
+      "min_5depth_lots_each_side": 10,
+      "min_valid_quote_rate": 0.95,
+      "min_paper_fill_rate": 0.80,
+      "excellent_score_min": 80,
+      "minimum_observations": 100,
+      "minimum_days": 20,
+      "minimum_outcome_observations": 20
+    },
+    "BSE_INDEX": {
+      "contract_quality_min": 85,
+      "min_top_book_lots": 3,
+      "min_5depth_lots_each_side": 15,
+      "min_valid_quote_rate": 0.97,
+      "min_paper_fill_rate": 0.85,
+      "excellent_score_min": 85,
+      "minimum_observations": 150,
+      "minimum_days": 20,
+      "minimum_outcome_observations": 20
+    },
+    "NSE_STOCK_OPTION": {
+      "contract_quality_min": 90,
+      "min_top_book_lots": 3,
+      "min_5depth_lots_each_side": 20,
+      "min_valid_quote_rate": 0.98,
+      "min_paper_fill_rate": 0.88,
+      "excellent_score_min": 87,
+      "minimum_observations": 200,
+      "minimum_days": 20,
+      "minimum_outcome_observations": 25
+    },
+    "BSE_STOCK_OPTION": {
+      "contract_quality_min": 92,
+      "min_top_book_lots": 4,
+      "min_5depth_lots_each_side": 25,
+      "min_valid_quote_rate": 0.98,
+      "min_paper_fill_rate": 0.90,
+      "excellent_score_min": 90,
+      "minimum_observations": 250,
+      "minimum_days": 20,
+      "minimum_outcome_observations": 25
+    }
+  },
+  "research_lifecycle": {
+    "initial_state_monitor_only": "MONITOR",
+    "promotion_order": ["MONITOR", "SHADOW", "PAPER_ELIGIBLE", "TRADE_ELIGIBLE"],
+    "retirement_state": "RETIRED",
+    "shadow_min_outcomes": 20,
+    "paper_min_closed_trades": 50,
+    "promotion_requires_walk_forward_review": true,
+    "monitor_only_never_auto_promotes_to_trade": false,
+    "paper_selector_all_configured_underlyings": true,
+    "trade_universe_mutation_allowed": false,
+    "paper_trade_policy_revision": "ALL_59_INSTRUMENTS_WITH_INSTRUMENT_GATE_CALIBRATION"
   },
   "instrument_calibration_status": {
     "BANKNIFTY": {
@@ -510,6 +605,21 @@
       "minimum_for_live_trade": 80,
       "midcap_minimum_for_live_trade": 85
     }
+  },
+  "portfolio_overlap_guard": {
+    "enabled": true,
+    "max_open_positions": 1,
+    "block_same_underlying": true,
+    "block_same_exposure_group": true,
+    "exposure_group_formula": "conservative underlying and factor grouping",
+    "research_only_overlap_diagnostics": true
+  },
+  "retirement_rules": {
+    "minimum_shadow_outcomes": 20,
+    "minimum_paper_trades": 50,
+    "negative_expectancy_retire_threshold_r": -0.25,
+    "data_quality_degradation_factor": 0.80,
+    "retirement_never_promotes_to_trade": true
   },
   "portfolio_no_trade_engine": {
     "enabled": true,
@@ -670,6 +780,49 @@
       "major_rbi_sebi_nse_surprise_not_digested": true,
       "unverified_major_news_with_abnormal_spreads": true
     }
+  },
+  "instrument_gate_learning": {
+    "enabled": true,
+    "warmup_days": 5,
+    "minimum_learning_observations": 100,
+    "minimum_learning_days": 20,
+    "minimum_learning_outcomes": 20,
+    "winning_quantile": 0.25,
+    "high_watermark_quantile": 0.90,
+    "candidate_quantiles": [0.50, 0.60, 0.70, 0.75, 0.80, 0.90],
+    "validation_fraction": 0.30,
+    "minimum_validation_outcomes": 10,
+    "minimum_validation_days": 5,
+    "validation_min_expectancy_r": 0.10,
+    "validation_max_drawdown_r": 10.0,
+    "minimum_retention": 0.60,
+    "maximum_gate_update_step_fraction": 0.10,
+    "required_stable_validation_windows": 2,
+    "minimum_improvement_r": 0.00,
+    "do_not_loosen": true,
+    "positive_expectancy_required": true,
+    "policy": "Start at strict class floors; collect linked skipped-forward evidence; test candidate gates on earlier observations; activate only the least restrictive gate with positive post-cost out-of-sample improvement across stable validation windows; roll back to the last validated gate when validation fails."
+  },
+  "evidence_profiles": {
+    "active_profile": "FYERS_PAPER_PROXY_RESEARCH",
+    "elasticity_status": "PROXY_RESEARCH_NOT_OBSERVED",
+    "mapping_status": "FYERS_PAPER_RESEARCH_ONLY",
+    "cost_status": "COST_MODEL_UNVALIDATED",
+    "global_risk_status": "OPTIONAL_PROXY_RESEARCH",
+    "exclude_from_canonical_validation": true
+  },
+  "runtime_risk_controls": {
+    "enforce_on_paper": false,
+    "risk_context_path": "paper_state/risk_context.json",
+    "stale_after_sec": 30,
+    "fail_closed_if_missing": true,
+    "source_required": true,
+    "rationale": "The paper runner can consume a verified external risk/news snapshot. Until a source is supplied, the system records UNAVAILABLE and preserves the existing paper research path; when enforcement is enabled, missing or stale context blocks new entries."
+  },
+  "playbook_runtime": {
+    "enforce_on_paper": false,
+    "require_rank_persistence": true,
+    "rationale": "Playbook and persistence filters are available for replay/shadow validation but remain disabled for paper trading until event and regime inputs are verified."
   },
   "dhan": {
     "client_id_env": "DHAN_CLIENT_ID",

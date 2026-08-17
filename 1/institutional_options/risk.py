@@ -62,11 +62,19 @@ class DynamicRiskCalculator:
         if ctx.mode.upper() == "DEFENSIVE":
             cap = float(inst_override.get("normal_risk_cap_rupees", risk["defensive_risk_max_rupees"]))
             return min(ctx.capital * float(risk["defensive_risk_max_pct_of_capital"]) / 100.0, float(risk["defensive_risk_max_rupees"]), cap)
+        normal_cap = min(
+            ctx.capital * float(risk["normal_risk_pct_of_capital"]) / 100.0,
+            float(inst_override.get("normal_risk_cap_rupees", risk["normal_risk_cap_rupees"])),
+        )
         if ctx.setup_grade.upper() in {"A+", "A_PLUS"}:
-            cap = float(inst_override.get("a_plus_risk_cap_rupees", risk["a_plus_risk_cap_rupees"]))
-            return min(ctx.capital * float(risk["a_plus_risk_pct_of_capital"]) / 100.0, cap)
-        cap = float(inst_override.get("normal_risk_cap_rupees", risk["normal_risk_cap_rupees"]))
-        return min(ctx.capital * float(risk["normal_risk_pct_of_capital"]) / 100.0, cap)
+            instrument_cap = min(
+                ctx.capital * float(risk["a_plus_risk_pct_of_capital"]) / 100.0,
+                float(inst_override.get("a_plus_risk_cap_rupees", risk["a_plus_risk_cap_rupees"])),
+            )
+            max_daily = float(risk.get("max_daily_loss_rupees", 0.0))
+            remaining = max(0.0, max_daily - max(0.0, ctx.realized_loss_today)) if max_daily > 0 else float("inf")
+            return min(normal_cap, instrument_cap, 0.80 * remaining)
+        return normal_cap
 
     def plan(self, ctx: RiskContext) -> RiskPlan:
         max_allowed = self.max_allowed_risk(ctx)
@@ -90,6 +98,6 @@ class DynamicRiskCalculator:
             return RiskPlan(max_allowed, hard_stop_points, planned_risk, False, minimum_viable, "Planned risk exceeds max allowed risk.")
         max_daily = float(self.config.section("risk")["max_daily_loss_rupees"])
         remaining = max_daily - max(0.0, ctx.realized_loss_today)
-        if planned_risk > 0.8 * remaining:
-            return RiskPlan(max_allowed, hard_stop_points, planned_risk, False, minimum_viable, "Planned risk exceeds remaining daily risk budget.")
+        if planned_risk > max_allowed + 1e-9:
+            return RiskPlan(max_allowed, hard_stop_points, planned_risk, False, minimum_viable, f"Planned risk exceeds new-trade cap {max_allowed:.2f} (remaining daily budget {remaining:.2f}).")
         return RiskPlan(max_allowed, hard_stop_points, planned_risk, True, minimum_viable, "")

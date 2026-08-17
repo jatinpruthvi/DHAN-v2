@@ -50,6 +50,21 @@ def _i(value: Any, default: int = 0) -> int:
     return int(float(value))
 
 
+def _source_timestamp(raw: Mapping[str, Any], fallback: datetime) -> tuple[datetime, bool]:
+    for key in ("timestamp", "exchange_timestamp", "last_traded_time", "exch_trade_time"):
+        value = raw.get(key)
+        if value in (None, ""):
+            continue
+        try:
+            if isinstance(value, (int, float)):
+                return datetime.fromtimestamp(float(value), UTC), True
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            return (parsed.astimezone(UTC) if parsed.tzinfo else parsed.replace(tzinfo=UTC)), True
+        except (TypeError, ValueError, OverflowError):
+            continue
+    return fallback, False
+
+
 @dataclass(frozen=True)
 class FyersExpiry:
     date_str: str
@@ -137,13 +152,15 @@ class FyersOptionChainParser:
              timestamp: datetime) -> OptionLeg:
         if raw is None:
             raise OptionChainParseError(f"Missing {option_type.value} at {strike}")
+        source_ts, source_available = _source_timestamp(raw, timestamp)
         quote = Quote(
             bid=_f(raw.get("bid")),
             ask=_f(raw.get("ask")),
             bid_qty=0,
             ask_qty=0,
             last=_f(raw.get("ltp")) if raw.get("ltp") is not None else None,
-            timestamp=timestamp,
+            timestamp=source_ts,
+            source_timestamp_available=source_available,
         )
         return OptionLeg(
             strike=strike,

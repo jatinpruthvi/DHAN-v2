@@ -33,6 +33,7 @@ def make_eval_and_fill():
         premium_elasticity=1.2,
         expected_move=200,
         required_move=100,
+        required_stop_points=10,
         convexity_edge_score=95,
         execution_quality_score=95,
         opportunity_confidence_score=95,

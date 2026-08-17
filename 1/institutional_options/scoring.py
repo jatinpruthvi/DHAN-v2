@@ -18,6 +18,7 @@ from .models import (
     TradeDecision,
 )
 from .risk import DynamicRiskCalculator, RiskContext
+from .research_controls import ClassGateSet
 
 
 def clamp(value: float, low: float = 0.0, high: float = 100.0) -> float:
@@ -38,7 +39,7 @@ class ContractQualityCalculator:
     def __init__(self, config: SystemConfig):
         self.config = config
 
-    def calculate(self, candidate: CandidateInputs, quote_stale: bool = False, expiry_day: bool = False, aplus_context: bool = False, theta_ratio: Optional[float] = None) -> ContractQualityBreakdown:
+    def calculate(self, candidate: CandidateInputs, quote_stale: bool = False, expiry_day: bool = False, aplus_context: bool = False, theta_ratio: Optional[float] = None, gates: Optional[ClassGateSet] = None) -> ContractQualityBreakdown:
         quote = candidate.quote
         if not quote.is_valid():
             return ContractQualityBreakdown(0, False, 0, 0, 0, 0, 0, 0, "Invalid bid/ask.")
@@ -46,17 +47,23 @@ class ContractQualityCalculator:
         spread = quote.spread
         spread_pct = spread / mid * 100.0 if mid > 0 else 999.0
         liq_cfg = self.config.section("liquidity")
+        source = gates if gates is not None else liq_cfg
+        def value(name: str) -> float:
+            return float(source[name] if isinstance(source, dict) else getattr(source, name))
         if candidate.moneyness == Moneyness.ATM:
-            ideal = float(liq_cfg["atm_spread_ideal_pct"]); acceptable = float(liq_cfg["atm_spread_acceptable_pct"]); reject = float(liq_cfg["atm_spread_reject_pct"])
+            ideal = value("atm_spread_ideal_pct"); acceptable = value("atm_spread_acceptable_pct"); reject = value("atm_spread_reject_pct")
         elif candidate.moneyness == Moneyness.ITM:
-            ideal = float(liq_cfg["itm_spread_ideal_pct"]); acceptable = float(liq_cfg["itm_spread_acceptable_pct"]); reject = float(liq_cfg["itm_spread_reject_pct"])
+            ideal = value("itm_spread_ideal_pct"); acceptable = value("itm_spread_acceptable_pct"); reject = value("itm_spread_reject_pct")
         else:
-            ideal = float(liq_cfg["otm_spread_ideal_pct"]); acceptable = float(liq_cfg["otm_spread_acceptable_pct"]); reject = float(liq_cfg["otm_spread_reject_pct"])
-        if quote_stale or spread_pct > reject or spread > float(liq_cfg["absolute_spread_cap_points"]):
+            ideal = value("otm_spread_ideal_pct"); acceptable = value("otm_spread_acceptable_pct"); reject = value("otm_spread_reject_pct")
+        if quote_stale or spread_pct > reject or spread > value("absolute_spread_cap_points"):
             return ContractQualityBreakdown(0, False, 0, 0, 0, 0, 0, 0, "Quote stale or spread hard rejected.")
         spread_score = linear_score(spread_pct, ideal, acceptable, reject)
         lot = candidate.instrument.lot_size
         min_top = min(quote.bid_qty / lot, quote.ask_qty / lot)
+        top_floor = value("min_top_book_lots") if gates is not None else 0.0
+        if gates is not None and min_top < top_floor:
+            return ContractQualityBreakdown(0, False, 0, 0, 0, 0, 0, 0, f"Top-book depth below {top_floor:.1f} lots.")
         if min_top >= 5:
             top_score = 100.0
         elif min_top >= 2:
@@ -67,12 +74,16 @@ class ContractQualityCalculator:
             top_score = 0.0
         if quote.cumulative_bid_qty_5depth is not None and quote.cumulative_ask_qty_5depth is not None:
             min_depth = min(quote.cumulative_bid_qty_5depth / lot, quote.cumulative_ask_qty_5depth / lot)
-            if min_depth >= 25:
+            depth_floor = value("min_5depth_lots_each_side") if gates is not None else 10.0
+            if gates is not None and min_depth < depth_floor:
+                return ContractQualityBreakdown(0, False, 0, 0, 0, 0, 0, 0, f"Five-level depth below {depth_floor:.1f} lots.")
+            depth_preferred = max(depth_floor * 2.5, depth_floor + 1.0)
+            if min_depth >= depth_preferred:
                 depth_score = 100.0
-            elif min_depth >= 10:
-                depth_score = 70.0 + 30.0 * (min_depth - 10.0) / 15.0
-            elif min_depth >= 5:
-                depth_score = 40.0 + 30.0 * (min_depth - 5.0) / 5.0
+            elif min_depth >= depth_floor:
+                depth_score = 70.0 + 30.0 * (min_depth - depth_floor) / max(1.0, depth_preferred - depth_floor)
+            elif min_depth >= depth_floor * 0.5:
+                depth_score = 40.0 + 30.0 * (min_depth - depth_floor * 0.5) / max(1.0, depth_floor * 0.5)
             else:
                 depth_score = 0.0
         else:
@@ -174,14 +185,16 @@ class PaperFillSimulator:
 
 
 class OpportunityScorer:
-    def __init__(self, config: SystemConfig):
+    def __init__(self, config: SystemConfig, gate_provider=None):
         self.config = config
+        self.gate_provider = gate_provider
         self.contract_quality = ContractQualityCalculator(config)
         self.risk = DynamicRiskCalculator(config)
 
     def evaluate(self, candidate: CandidateInputs, realized_loss_today: float = 0.0) -> OpportunityEvaluation:
         reasons: list[str] = []
-        cq = self.contract_quality.calculate(candidate, quote_stale=not candidate.data_health.valid)
+        gates = self._gates(candidate)
+        cq = self.contract_quality.calculate(candidate, quote_stale=not candidate.data_health.valid, gates=gates)
         setup_grade_hint = "A+" if candidate.opportunity_confidence_score >= 80 and candidate.convexity_edge_score >= 90 else "A"
         risk_plan = self.risk.plan(RiskContext(
             capital=float(self.config.section("capital")["starting_capital"]),
@@ -198,18 +211,100 @@ class OpportunityScorer:
         ))
         if not candidate.data_health.valid:
             reasons.append("DataHealth invalid")
+        contract_min = float(gates.contract_quality_min) if gates is not None else float(self.config.section("opportunity_selection").get("require_contract_quality_min", 0.0))
+        if gates is not None and gates.status == CalibrationStatus.RETIRED:
+            reasons.append("Instrument lifecycle retired")
+        if candidate.lifecycle_state == "RETIRED":
+            reasons.append("Instrument lifecycle retired")
+        if gates is not None and candidate.calibrated_success_probability is not None and candidate.calibrated_success_probability < gates.min_calibrated_probability:
+            reasons.append(f"Class calibrated probability below minimum: {candidate.calibrated_success_probability:.2f} < {gates.min_calibrated_probability:.2f}")
+        if gates is not None and candidate.calibrated_net_expectancy_r is not None and candidate.calibrated_net_expectancy_r < gates.min_net_expectancy_r:
+            reasons.append(f"Class calibrated expectancy below minimum: {candidate.calibrated_net_expectancy_r:.2f}R < {gates.min_net_expectancy_r:.2f}R")
         if not cq.valid:
             reasons.append(f"Contract invalid: {cq.reason}")
+        elif cq.score < contract_min:
+            reasons.append(f"ContractQuality below minimum: {cq.score:.1f} < {contract_min:.1f}")
         if not risk_plan.hard_stop_fit:
             reasons.append(f"HardStopFit false: {risk_plan.reason}")
-        if candidate.iv_crush_risk_score > float(self.config.section("iv_crush")["hard_veto_above"]):
-            reasons.append("IVCrush hard veto")
-        if candidate.premium_elasticity < float(self.config.section("premium_elasticity")["reject_or_exit_threshold"]):
-            reasons.append("PremiumElasticity hard reject")
-        if candidate.expected_required_ratio < float(self.config.section("expected_move")["hard_reject_ratio"]):
-            reasons.append("Expected/Required hard reject")
-        if candidate.market_hostility_score > float(self.config.section("scores")["market_hostility_survival_max"]):
-            reasons.append("MarketHostility hard reject")
+        direction_cfg = self.config.section("phase1_direction_models")
+        score_cfg = self.config.section("scores")
+        selection_cfg = self.config.section("opportunity_selection")
+        excellent_cfg = selection_cfg.get("excellent_gate_requirements", {})
+        if not isinstance(excellent_cfg, dict):
+            excellent_cfg = {}
+        elasticity_cfg = self.config.section("premium_elasticity")
+        expected_cfg = self.config.section("expected_move")
+        direction_permission = max(
+            float(direction_cfg.get("direction_bullish_permission", 45.0)),
+            float(score_cfg.get("direction_min", 0.0)),
+            float(getattr(gates, "direction_min", 0.0)) if gates is not None else 0.0,
+        )
+        # CandidateFactory stores direction from the candidate's own perspective:
+        # calls inherit bullish context and puts negate it.  A negative value is
+        # therefore a wrong-side setup, not a source of positive conviction.
+        if candidate.instrument_direction_score < direction_permission:
+            reasons.append(
+                f"SideDirection hard reject: {candidate.instrument_direction_score:.1f} < {direction_permission:.1f}"
+            )
+        iv_max = min(
+            float(selection_cfg.get("require_iv_crush_max", float("inf"))),
+            float(self.config.section("iv_crush").get("hard_veto_above", float("inf"))),
+            float(getattr(gates, "iv_crush_max", float("inf"))) if gates is not None else float("inf"),
+        )
+        if candidate.iv_crush_risk_score > iv_max:
+            reasons.append(f"IVCrush hard reject: {candidate.iv_crush_risk_score:.1f} > {iv_max:.1f}")
+        elasticity_min = max(
+            float(selection_cfg.get("require_premium_elasticity_min", 0.0)),
+            float(elasticity_cfg.get("reject_or_exit_threshold", 0.0)),
+            float(getattr(gates, "premium_elasticity_min", 0.0)) if gates is not None else 0.0,
+        )
+        if candidate.premium_elasticity < elasticity_min:
+            reasons.append(f"PremiumElasticity hard reject: {candidate.premium_elasticity:.2f} < {elasticity_min:.2f}")
+        ratio_min = max(
+            float(selection_cfg.get("require_expected_required_ratio_min", 0.0)),
+            float(expected_cfg.get("hard_reject_ratio", 0.0)),
+            float(getattr(gates, "expected_required_ratio_min", 0.0)) if gates is not None else 0.0,
+        )
+        if candidate.expected_required_ratio < ratio_min:
+            reasons.append(f"Expected/Required hard reject: {candidate.expected_required_ratio:.2f} < {ratio_min:.2f}")
+        hostility_max = min(
+            float(selection_cfg.get("require_market_hostility_max", 100.0)),
+            float(score_cfg.get("market_hostility_survival_max", 100.0)),
+            float(getattr(gates, "market_hostility_max", 100.0)) if gates is not None else 100.0,
+        )
+        if candidate.market_hostility_score > hostility_max:
+            reasons.append(f"MarketHostility hard reject: {candidate.market_hostility_score:.1f} > {hostility_max:.1f}")
+        spread_pct = candidate.quote.spread / candidate.quote.mid * 100.0 if candidate.quote.mid > 0 else float("inf")
+        learned_spread_max = float(getattr(gates, "spread_pct_max", float("inf"))) if gates is not None else float("inf")
+        if spread_pct > learned_spread_max:
+            reasons.append(f"InstrumentSpread hard reject: {spread_pct:.2f} > {learned_spread_max:.2f}")
+        if candidate.trade_quality_score < max(float(score_cfg.get("trade_quality_min", 0.0)), float(getattr(gates, "trade_quality_min", 0.0)) if gates is not None else 0.0):
+            reasons.append("TradeQuality below configured minimum")
+        if candidate.regime_confidence < max(float(score_cfg.get("regime_confidence_min", 0.0)), float(getattr(gates, "regime_confidence_min", 0.0)) if gates is not None else 0.0):
+            reasons.append("RegimeConfidence below configured minimum")
+        if candidate.opportunity_confidence_score < max(float(score_cfg.get("final_confidence_min", 0.0)), float(getattr(gates, "final_confidence_min", 0.0)) if gates is not None else 0.0):
+            reasons.append("FinalConfidence below configured minimum")
+        execution_min = max(
+            float(excellent_cfg.get("execution_quality_min", 80.0)),
+            float(getattr(gates, "execution_quality_min", 0.0)) if gates is not None else 0.0,
+        )
+        if candidate.execution_quality_score < execution_min:
+            reasons.append(f"ExecutionQuality below excellent gate: {candidate.execution_quality_score:.1f} < {execution_min:.1f}")
+        convexity_min = float(excellent_cfg.get("convexity_edge_min", 80.0))
+        if candidate.convexity_edge_score < convexity_min:
+            reasons.append(f"ConvexityEdge below excellent gate: {candidate.convexity_edge_score:.1f} < {convexity_min:.1f}")
+        confidence_min = max(
+            float(excellent_cfg.get("opportunity_confidence_min", 70.0)),
+            float(score_cfg.get("final_confidence_min", 0.0)),
+            float(getattr(gates, "final_confidence_min", 0.0)) if gates is not None else 0.0,
+        )
+        if candidate.opportunity_confidence_score < confidence_min:
+            reasons.append(f"OpportunityConfidence below excellent gate: {candidate.opportunity_confidence_score:.1f} < {confidence_min:.1f}")
+        regime_fit_min = float(excellent_cfg.get("regime_fit_min", 70.0))
+        if candidate.regime_fit_score < regime_fit_min:
+            reasons.append(f"RegimeFit below excellent gate: {candidate.regime_fit_score:.1f} < {regime_fit_min:.1f}")
+        if bool(excellent_cfg.get("required_stop_must_be_configured", True)) and candidate.required_stop_points <= 0:
+            reasons.append("RequiredStop unavailable or non-positive")
         raw = self._raw_opportunity_score(candidate, cq.score)
         comparable = raw - self._calibration_penalty(candidate)
         threshold = self._dynamic_threshold(candidate)
@@ -223,12 +318,16 @@ class OpportunityScorer:
         score = (
             float(weights.get("trade_quality_score", 0.25)) * c.trade_quality_score +
             float(weights.get("convexity_quality_score", 0.20)) * c.convexity_edge_score +
-            float(weights.get("direction_score", 0.15)) * abs(c.instrument_direction_score) +
+            float(weights.get("direction_score", 0.15)) * max(0.0, c.instrument_direction_score) +
             float(weights.get("execution_quality_score", 0.15)) * c.execution_quality_score +
             float(weights.get("regime_fit_score", 0.10)) * c.regime_fit_score +
             float(weights.get("opportunity_confidence_score", 0.10)) * c.opportunity_confidence_score +
             float(weights.get("contract_quality_score", 0.05)) * contract_quality_score
         )
+        if c.calibrated_net_expectancy_r is not None:
+            # Post-cost expectancy ranks candidates only after hard gates have
+            # been applied; it cannot turn a rejected candidate into an entry.
+            score += max(-10.0, min(10.0, float(c.calibrated_net_expectancy_r) * 8.0))
         score -= max(0.0, c.market_hostility_score - 20.0) * 0.25
         return clamp(score)
 
@@ -244,11 +343,27 @@ class OpportunityScorer:
 
     def _dynamic_threshold(self, c: CandidateInputs) -> float:
         base = float(self.config.section("opportunity_selection")["excellent_opportunity_min_score"])
+        gates = self._gates(c)
+        if gates is not None:
+            base = max(base, gates.excellent_score_min)
         if c.instrument.underlying == "MIDCPNIFTY" and c.calibration_status_liquidity != CalibrationStatus.VALIDATED:
             base += 10.0
         if c.iv_crush_risk_score >= 50.0:
             base += 5.0
         return base
+
+    def _gates(self, candidate: CandidateInputs) -> Optional[ClassGateSet]:
+        if self.gate_provider is None:
+            return None
+        try:
+            return self.gate_provider(candidate.instrument.instrument_class, candidate.instrument.underlying)
+        except TypeError:
+            try:
+                return self.gate_provider(candidate.instrument.instrument_class)
+            except Exception:
+                return None
+        except Exception:
+            return None
 
     @staticmethod
     def _grade(score: float, threshold: float, reasons: list[str]) -> OpportunityGrade:

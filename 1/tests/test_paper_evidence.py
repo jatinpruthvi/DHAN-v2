@@ -3,6 +3,7 @@ import tempfile
 import unittest
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 from institutional_options.config import SystemConfig
 from institutional_options.engine import PaperPortfolioState
@@ -17,6 +18,9 @@ from institutional_options.paper_evidence import (
 from institutional_options.paper_runner import now_ist
 from institutional_options.paper_signal import PaperSignalCalculator
 from institutional_options.scoring import OpportunityScorer
+from institutional_options.records import MTILRecordBuilder
+from institutional_options.mtil import MTILField, MTILSchema
+from institutional_options.option_chain import OptionChainSnapshot, OptionLeg, OptionStrike
 
 CFG_PATH = "uploads/PARAMETERS.json"
 
@@ -94,11 +98,93 @@ class EvidenceCsvTests(unittest.TestCase):
         self.assertEqual(rows[0]["rank"], "1")   # highest score first
         self.assertGreater(float(rows[0]["OpportunityScore"]), float(rows[1]["OpportunityScore"]))
         self.assertIn("skip_id", rows[0])
+        queue_rows = list(self._csv_rows(self.dir / "skipped_forward_queue.csv"))
+        self.assertEqual(len(queue_rows), 2)
+        self.assertIn("gate_features_json", queue_rows[0])
+        self.assertIn("gate_snapshot_id", queue_rows[0])
+        self.assertEqual(queue_rows[0]["instrument_id"], queue_rows[0]["underlying"])
 
     def test_report_builds_from_empty_state(self):
         text = build_evidence_report(self.dir, SystemConfig.from_file(CFG_PATH))
         self.assertIn("PAPER-EVIDENCE REPORT", text)
         self.assertIn("no data yet", text)
+
+    def test_existing_csv_header_migrates_for_new_fields(self):
+        path = self.dir / "legacy.csv"
+        path.write_text("old,\nvalue,\n", encoding="utf-8")
+        writer = AppendingCsv(path)
+        writer.append({"old": "new", "parameter_profile": "PAPER_OVERRIDE"})
+        rows = list(self._csv_rows(path))
+        self.assertEqual(rows[0]["old"], "value")
+        self.assertEqual(rows[1]["old"], "new")
+        self.assertEqual(rows[1]["parameter_profile"], "PAPER_OVERRIDE")
+
+    def test_mtil_builder_applies_schema_defaults(self):
+        cfg = SystemConfig.from_file(CFG_PATH)
+        candidate = make_candidate({"direction": 90, "trade_quality": 90, "regime_confidence": 80,
+                                    "hostility": 10, "elasticity": 0.8, "expected_move": 200,
+                                    "required_move": 100, "ratio": 2.0, "ev_r": 1.0, "vol_edge": 2.0,
+                                    "convexity": 90, "execution": 90, "confidence": 90, "regime_fit": 90})
+        evaluation = OpportunityScorer(cfg).evaluate(candidate)
+        fill = PaperFill(True, candidate.quote.mid, None, 0.0, "")
+        trade = PaperTrade("schema-test", evaluation, fill, now_ist(), exit_fill=fill,
+                           exit_time=now_ist(), exit_reason="TARGET")
+        schema = MTILSchema([MTILField("test", "test_float", "float", False, "", "", "", "")])
+        row = MTILRecordBuilder.from_paper_trade(trade, schema=schema)
+        self.assertEqual(row["test_float"], 0)
+
+    def test_mtil_trade_row_preserves_gross_costs_and_net(self):
+        cfg = SystemConfig.from_file(CFG_PATH)
+        candidate = make_candidate({"direction": 90, "trade_quality": 90, "regime_confidence": 80,
+                                    "hostility": 10, "elasticity": 0.8, "expected_move": 200,
+                                    "required_move": 100, "ratio": 2.0, "ev_r": 1.0, "vol_edge": 2.0,
+                                    "convexity": 90, "execution": 90, "confidence": 90, "regime_fit": 90})
+        evaluation = OpportunityScorer(cfg).evaluate(candidate)
+        fill = PaperFill(True, candidate.quote.mid, None, 0.0, "")
+        trade = PaperTrade("accounting-test", evaluation, fill, now_ist(), exit_fill=fill,
+                           exit_time=now_ist(), exit_reason="TARGET")
+        col = PaperEvidenceCollector(self.dir)
+        col.record_trade(trade, net_pnl_rupees=95.0, r_multiple=1.0,
+                         gross_pnl_rupees=100.0, total_costs_rupees=5.0)
+        row = list(self._csv_rows(self.dir / "mtil.csv"))[0]
+        self.assertEqual(float(row["gross_pnl_rupees"]), 100.0)
+        self.assertEqual(float(row["total_costs_rupees"]), 5.0)
+        self.assertEqual(float(row["net_pnl_rupees"]), 95.0)
+        self.assertEqual(row["mapping_validation_passed"], "False")
+        self.assertEqual(row["tick_size_validation_passed"], "True")
+        self.assertEqual(row["elasticity_status"], "PROXY_RESEARCH_NOT_OBSERVED")
+        self.assertEqual(row["data_health_valid"], "True")
+
+    def test_record_trade_and_skipped_rows_use_runtime_versions(self):
+        cfg = SystemConfig.from_file(CFG_PATH)
+        candidate = make_candidate({"direction": 90, "trade_quality": 90, "regime_confidence": 80,
+                                    "hostility": 10, "elasticity": 0.8, "expected_move": 200,
+                                    "required_move": 100, "ratio": 2.0, "ev_r": 1.0, "vol_edge": 2.0,
+                                    "convexity": 90, "execution": 90, "confidence": 90, "regime_fit": 90})
+        evaluation = OpportunityScorer(cfg).evaluate(candidate)
+        col = PaperEvidenceCollector(self.dir)
+        col.record_skipped([evaluation], ranking_cycle_id="v-test")
+        skipped = list(self._csv_rows(self.dir / "skipped.csv"))[0]
+        self.assertEqual(skipped["strategy_version"], col.versions.strategy_version)
+        self.assertEqual(skipped["score_version"], col.versions.score_version)
+        self.assertEqual(skipped["universe_version"], col.versions.universe_version)
+
+    def test_record_monitor_snapshot_normalizes_lots_and_preserves_unknown_metadata_as_blank(self):
+        ts = now_ist()
+        quote = make_quote(mid=100.0, spread=0.6)
+        leg = OptionLeg(25000.0, OptionType.CE, "ce", quote, Greeks(), None, 0, 0, 0, 0, 0)
+        strike = OptionStrike(25000.0, leg, None)
+        chain = OptionChainSnapshot("NIFTY", 25000.0, "2026-08-25", ts, (strike,))
+        context = SimpleNamespace(direction_score=60.0, trade_quality_score=70.0, market_hostility_score=10.0)
+        col = PaperEvidenceCollector(self.dir)
+        col.record_monitor_snapshot("NIFTY", "NSE", chain, context, None, lot_size=65,
+                                    lifecycle_state="SHADOW", ts=ts)
+        row = list(self._csv_rows(self.dir / "monitor_diagnostics.csv"))[0]
+        self.assertAlmostEqual(float(row["atm_ce_top_book_lots"]), 50.0 / 65.0)
+        self.assertEqual(row["lifecycle_state"], "SHADOW")
+        col.record_monitor_snapshot("NIFTY", "NSE", chain, context, None, lot_size=None, ts=ts)
+        rows = list(self._csv_rows(self.dir / "monitor_diagnostics.csv"))
+        self.assertEqual(rows[-1]["atm_ce_top_book_lots"], "")
 
     def test_record_candidates_writes_full_detail_rows(self):
         cfg = SystemConfig.from_file(CFG_PATH)
@@ -123,6 +209,17 @@ class EvidenceCsvTests(unittest.TestCase):
                     "confidence", "exp_req_ratio", "bid", "ask", "mid", "spread_pct", "reasons"):
             self.assertIn(key, rows[0])
         self.assertIsInstance(rows[0]["reasons"], str)
+        diagnostics = list(self._csv_rows(self.dir / "candidate_diagnostics.csv"))
+        self.assertEqual(len(diagnostics), 2)
+        for key in ("side_direction_score", "direction_gate_passed",
+                    "contract_quality_score", "contract_quality_gate_passed",
+                    "gate_optimization_status", "gate_validation_observations",
+                    "gate_validation_retention", "rejection_count", "rejection_reasons"):
+            self.assertIn(key, diagnostics[0])
+        # The strong call is aligned and the weak PE is wrong-sided in this
+        # fixture, so the diagnostics must make the distinction explicit.
+        self.assertEqual(diagnostics[0]["direction_gate_passed"], "True")
+        self.assertEqual(diagnostics[1]["direction_gate_passed"], "False")
 
     def _csv_rows(self, path):
         import csv

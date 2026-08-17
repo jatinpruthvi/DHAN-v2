@@ -28,7 +28,7 @@ class Phase2Tests(unittest.TestCase):
                     'DirectionScore':'80','TradeQualityScore':'80','ContractQualityScore':'80','MarketHostilityScore':'10',
                     'planned_risk_rupees':'500','net_pnl_rupees': '100' if i%2==0 else '-50','r_multiple':'1' if i%2==0 else '-0.5',
                     'trade_archetype_code':'A01','signal_combination_id':'S','regime_combination_id':'G','opportunity_cluster_id':'C',
-                    'revalidation_passed':'true','paper_fill_model':'bid_ask','rule_violations':'','rule_violation_type':''
+                    'entry_revalidation_passed':'true','paper_fill_model':'bid_ask','rule_violations':'','rule_violation_type':''
                 })
                 skipped.append({'skip_id':f'SK{i}','timestamp':f'2026-06-{day:02d}T10:00:00','ranking_cycle_id':f'R{i}','underlying':'NIFTY','option_type':'PE','rank':'2','OpportunityScore':'70','DirectionScore':'70','TradeQualityScore':'70','ContractQualityScore':'80','PremiumElasticity':'1','ExpectedMove':'100','RequiredMove':'80','ExpectedRequiredRatio':'1.25','IVCrushRiskScore':'20','MarketHostilityScore':'10','RegimeConfidence':'75','DataHealthStatus':'VALID','hard_stop_fit':'true','why_not_traded':'lower rank','calibration_status':'UNVALIDATED','would_have_hit_target':'false','would_have_hit_stop':'true'})
             mp=Path(d)/'mtil.csv'; sp=Path(d)/'skipped.csv'

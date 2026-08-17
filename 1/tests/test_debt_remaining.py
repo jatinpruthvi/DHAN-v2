@@ -2,6 +2,7 @@ import unittest
 from datetime import datetime, date, UTC
 from pathlib import Path
 import tempfile
+from dataclasses import replace
 
 from institutional_options.config import SystemConfig
 from institutional_options.costs import validate_charges_config
@@ -33,7 +34,7 @@ class RemainingDebtTests(unittest.TestCase):
     def test_datahealth_candidate_quote(self):
         cfg=SystemConfig.from_file('uploads/PARAMETERS.json')
         orch=DataHealthOrchestrator(cfg)
-        c=candidate()
+        c=replace(candidate(), quote=replace(candidate().quote, source_timestamp_available=True))
         health=orch.evaluate_candidate(c, c.quote.timestamp)
         self.assertTrue(health.valid)
 
