@@ -55,6 +55,10 @@ class SystemConfig:
             raise ConfigError("Overnight holding must be disabled for MVP.")
         if capital.get("auto_execution_mvp") is not False:
             raise ConfigError("Auto execution must be disabled for MVP.")
+        data_health = self.section("data_health")
+        stale_alert_cycles = data_health.get("stale_alert_consecutive_cycles", 2)
+        if isinstance(stale_alert_cycles, bool) or not isinstance(stale_alert_cycles, int) or stale_alert_cycles <= 0:
+            raise ConfigError("data_health.stale_alert_consecutive_cycles must be a positive integer.")
         execution = self.section("execution")
         if execution.get("live_trading_enabled") is not False:
             raise ConfigError("live_trading_enabled must be false for current MVP/Phase 1-3 implementation.")

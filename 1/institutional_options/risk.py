@@ -53,15 +53,27 @@ class DynamicRiskCalculator:
     def __init__(self, config: SystemConfig):
         self.config = config
 
+    def _remaining_daily_budget(self, ctx: RiskContext) -> float:
+        max_daily = float(self.config.section("risk").get("max_daily_loss_rupees", 0.0))
+        if max_daily <= 0:
+            return float("inf")
+        return max(0.0, max_daily - max(0.0, float(ctx.realized_loss_today)))
+
     def max_allowed_risk(self, ctx: RiskContext) -> float:
         risk = self.config.section("risk")
         overrides = self.config.raw.get("instrument_risk_overrides", {})
         inst_override = overrides.get(ctx.instrument.upper(), {}) if isinstance(overrides, dict) else {}
         if ctx.mode.upper() in {"SURVIVAL", "NO_TRADE"}:
             return 0.0
+        daily_cap = 0.80 * self._remaining_daily_budget(ctx)
         if ctx.mode.upper() == "DEFENSIVE":
             cap = float(inst_override.get("normal_risk_cap_rupees", risk["defensive_risk_max_rupees"]))
-            return min(ctx.capital * float(risk["defensive_risk_max_pct_of_capital"]) / 100.0, float(risk["defensive_risk_max_rupees"]), cap)
+            return min(
+                ctx.capital * float(risk["defensive_risk_max_pct_of_capital"]) / 100.0,
+                float(risk["defensive_risk_max_rupees"]),
+                cap,
+                daily_cap,
+            )
         normal_cap = min(
             ctx.capital * float(risk["normal_risk_pct_of_capital"]) / 100.0,
             float(inst_override.get("normal_risk_cap_rupees", risk["normal_risk_cap_rupees"])),
@@ -71,10 +83,8 @@ class DynamicRiskCalculator:
                 ctx.capital * float(risk["a_plus_risk_pct_of_capital"]) / 100.0,
                 float(inst_override.get("a_plus_risk_cap_rupees", risk["a_plus_risk_cap_rupees"])),
             )
-            max_daily = float(risk.get("max_daily_loss_rupees", 0.0))
-            remaining = max(0.0, max_daily - max(0.0, ctx.realized_loss_today)) if max_daily > 0 else float("inf")
-            return min(normal_cap, instrument_cap, 0.80 * remaining)
-        return normal_cap
+            return min(normal_cap, instrument_cap, daily_cap)
+        return min(normal_cap, daily_cap)
 
     def plan(self, ctx: RiskContext) -> RiskPlan:
         max_allowed = self.max_allowed_risk(ctx)
@@ -96,8 +106,4 @@ class DynamicRiskCalculator:
             return RiskPlan(max_allowed, hard_stop_points, planned_risk, False, minimum_viable, "Hard stop is below minimum viable stop.")
         if planned_risk > max_allowed + 1e-9:
             return RiskPlan(max_allowed, hard_stop_points, planned_risk, False, minimum_viable, "Planned risk exceeds max allowed risk.")
-        max_daily = float(self.config.section("risk")["max_daily_loss_rupees"])
-        remaining = max_daily - max(0.0, ctx.realized_loss_today)
-        if planned_risk > max_allowed + 1e-9:
-            return RiskPlan(max_allowed, hard_stop_points, planned_risk, False, minimum_viable, f"Planned risk exceeds new-trade cap {max_allowed:.2f} (remaining daily budget {remaining:.2f}).")
         return RiskPlan(max_allowed, hard_stop_points, planned_risk, True, minimum_viable, "")

@@ -151,6 +151,7 @@ class CandidateInputs:
     calibrated_net_expectancy_r: Optional[float] = None
     lifecycle_state: str = "SHADOW"
     exposure_group: str = ""
+    setup_grade: str = ""
 
     @property
     def side(self) -> OptionType:

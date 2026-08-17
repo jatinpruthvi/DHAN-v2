@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Mapping, Any
 
@@ -18,6 +19,28 @@ class OrderIntent:
     quantity: int
     price: float
     correlation_id: str = ""
+
+    def validation_errors(self) -> tuple[str, ...]:
+        errors: list[str] = []
+        if self.transaction_type.upper() not in {"BUY", "SELL"}:
+            errors.append("transaction_type must be BUY or SELL")
+        if self.exchange_segment.upper() not in {"NSE_FNO", "BSE_FNO"}:
+            errors.append("exchange_segment must be NSE_FNO or BSE_FNO")
+        if self.product_type.upper() != "INTRADAY":
+            errors.append("product_type must be INTRADAY")
+        if self.order_type.upper() != "LIMIT":
+            errors.append("order_type must be LIMIT")
+        if self.validity.upper() != "DAY":
+            errors.append("validity must be DAY")
+        if not str(self.dhan_client_id).strip():
+            errors.append("dhan_client_id is required")
+        if not str(self.security_id).strip():
+            errors.append("security_id is required")
+        if isinstance(self.quantity, bool) or not isinstance(self.quantity, int) or self.quantity <= 0:
+            errors.append("quantity must be a positive integer")
+        if not isinstance(self.price, (int, float)) or not math.isfinite(float(self.price)) or float(self.price) <= 0:
+            errors.append("price must be a finite positive number")
+        return tuple(errors)
 
     def to_dhan_payload(self) -> dict[str, Any]:
         return {
@@ -51,4 +74,13 @@ class ExecutionRouter:
         self.dhan_client = dhan_client
 
     def place(self, intent: OrderIntent) -> Mapping[str, Any]:
+        errors = intent.validation_errors()
+        if errors:
+            return {
+                "demo": bool(getattr(self.dhan_client, "demo_trade", False)),
+                "orderStatus": "REJECTED_VALIDATION",
+                "payload": intent.to_dhan_payload(),
+                "message": "; ".join(errors),
+                "validationErrors": list(errors),
+            }
         return self.dhan_client.place_order(intent.to_dhan_payload())

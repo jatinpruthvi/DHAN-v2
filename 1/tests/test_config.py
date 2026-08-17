@@ -28,6 +28,13 @@ class ConfigTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             SystemConfig(raw=raw).validate()
 
+    def test_invalid_stale_alert_threshold_is_rejected(self):
+        raw = json.loads(Path("uploads/PARAMETERS.json").read_text(encoding="utf-8"))
+        raw["data_health"] = copy.deepcopy(raw["data_health"])
+        raw["data_health"]["stale_alert_consecutive_cycles"] = 0
+        with self.assertRaises(ValueError):
+            SystemConfig(raw=raw).validate()
+
     def test_invalid_walk_forward_grid_is_rejected(self):
         raw = json.loads(Path("uploads/PARAMETERS.json").read_text(encoding="utf-8"))
         raw["instrument_gate_learning"] = copy.deepcopy(raw["instrument_gate_learning"])

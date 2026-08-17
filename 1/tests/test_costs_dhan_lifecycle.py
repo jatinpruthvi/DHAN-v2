@@ -60,6 +60,23 @@ class AddedModuleTests(unittest.TestCase):
         self.assertTrue(res["demo"])
         self.assertEqual(res["orderStatus"], "DEMO_NOT_SENT")
 
+    def test_execution_router_rejects_malformed_order_before_broker_call(self):
+        class StubClient:
+            demo_trade = False
+            called = False
+
+            def place_order(self, payload):
+                self.called = True
+                return {"orderStatus": "SHOULD_NOT_BE_CALLED"}
+
+        client = StubClient()
+        router = ExecutionRouter(client)
+        result = router.place(OrderIntent("client", "BUY", "NSE_FNO", "INTRADAY", "LIMIT", "DAY", "", 0, 100.0))
+        self.assertEqual(result["orderStatus"], "REJECTED_VALIDATION")
+        self.assertFalse(client.called)
+        self.assertIn("security_id is required", result["validationErrors"])
+        self.assertIn("quantity must be a positive integer", result["validationErrors"])
+
     def test_lifecycle_exits_target(self):
         cfg, ev, fill, now = make_eval_and_fill()
         trade = PaperTrade("T1", ev, fill, now)

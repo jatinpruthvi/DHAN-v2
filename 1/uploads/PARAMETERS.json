@@ -65,6 +65,7 @@
     "reconnect_stable_wait_sec": 30,
     "repeated_api_error_window_min": 5,
     "repeated_api_error_count_no_trade": 2,
+    "stale_alert_consecutive_cycles": 2,
     "require_source_timestamp_for_approval": true,
     "require_chain_semantics_for_approval": true,
     "fail_closed_after_source_timestamp_unavailable": true

@@ -200,6 +200,7 @@ class PaperRunner:
         self._last_monitor_batch: list[str] = []
         self._risk_context = self._load_risk_context()
         self._playbook_codes_by_underlying: dict[str, frozenset[str]] = {}
+        self._playbook_grades_by_underlying: dict[str, str] = {}
         self.playbook_engine = RegimePlaybookSelectionEngine(
             excellent_threshold=float(self.config.section("opportunity_selection").get("excellent_opportunity_min_score", 80.0))
         )
@@ -623,6 +624,49 @@ class PaperRunner:
 
     # -- candidate building + selection -----------------------------------------
 
+    def _record_data_health_observation(self, underlying: str, health: DataHealth, now: datetime, scope: str) -> None:
+        """Persist stale/invalid transitions so repeated feed failures are visible."""
+        target = self.state.underlyings.setdefault(underlying, {})
+        prior = dict(target.get("stale_data_alert", {}))
+        threshold = max(1, int(self.config.section("data_health").get("stale_alert_consecutive_cycles", 2)))
+        was_alert = str(prior.get("status", "CLEAR")) == "ALERT"
+        if health.valid and not health.warning:
+            alert = {
+                "status": "CLEAR",
+                "consecutive_bad_cycles": 0,
+                "last_valid_at": now.isoformat(),
+                "last_bad_at": prior.get("last_bad_at", ""),
+                "last_reason": health.reason or "",
+                "scope": scope,
+            }
+        else:
+            consecutive = int(prior.get("consecutive_bad_cycles", 0) or 0) + 1
+            status = "ALERT" if consecutive >= threshold else "OBSERVING"
+            alert = {
+                "status": status,
+                "consecutive_bad_cycles": consecutive,
+                "alert_threshold_cycles": threshold,
+                "last_valid_at": prior.get("last_valid_at", ""),
+                "last_bad_at": now.isoformat(),
+                "last_reason": health.reason or "Data health warning",
+                "scope": scope,
+            }
+            if status == "ALERT" and not was_alert:
+                self._log(f"  DATA HEALTH ALERT {underlying}: {alert['last_reason']}")
+                self.event_ledger.append(
+                    "DATA_HEALTH_ALERT", session_id=self.state.session_id,
+                    underlying=underlying,
+                    exchange=self.universe.get(underlying, {}).get("exchange", "NSE"),
+                    instrument_kind=self.universe.get(underlying, {}).get("instrument_kind", "INDEX"),
+                    instrument_class=class_for_metadata(
+                        self.universe.get(underlying, {}).get("exchange", "NSE"),
+                        self.universe.get(underlying, {}).get("instrument_kind", "INDEX"),
+                    ),
+                    decision_source="data_health_orchestrator", ts=now,
+                    payload=alert,
+                )
+        target["stale_data_alert"] = alert
+
     def _build_candidates(self, chains, context_map, scope: str = "trade") -> list:
         if scope not in {"trade", "monitor"}:
             raise ValueError(f"Unsupported candidate build scope: {scope}")
@@ -677,14 +721,21 @@ class PaperRunner:
                 data_health=chain_health,
             )
             cands = self.factory.candidates_from_chain(chain, expiry, lot, tick, cctx)
+            candidate_health_failures = 0
+            candidate_health_reasons: list[str] = []
             setup_codes = self._playbook_codes_by_underlying.get(und)
+            setup_grade = self._playbook_grades_by_underlying.get(und, "")
             if scope == "trade" and self.config.section("playbook_runtime").get("enforce_on_paper", False) and not setup_codes:
                 continue
             setup_type = next(iter(setup_codes), "UNKNOWN") if setup_codes else "UNKNOWN"
             surface = OptionSurfaceDiagnostics.calculate(chain)
             for c in cands:
-                c = replace(c, setup_type=setup_type)
+                c = replace(c, setup_type=setup_type, setup_grade=setup_grade)
                 candidate_health = self.data_health.evaluate_candidate(c, now_ist())
+                if not candidate_health.valid or candidate_health.warning:
+                    candidate_health_failures += 1
+                    if candidate_health.reason:
+                        candidate_health_reasons.append(candidate_health.reason)
                 combined_health = DataHealth(
                     valid=chain_health.valid and candidate_health.valid,
                     warning=chain_health.warning or candidate_health.warning,
@@ -729,6 +780,8 @@ class PaperRunner:
                     "gate_validation_drawdown_r": active_gates.gate_validation_drawdown_r,
                     "gate_validation_retention": active_gates.gate_validation_retention,
                     "gate_last_validated_at": active_gates.gate_last_validated_at,
+                    "setup_grade": setup_grade or "UNAVAILABLE",
+                    "setup_grade_source": "PLAYBOOK_METADATA" if setup_grade else "SCORE_FALLBACK",
                 })
                 notes.update({
                     "observed_elasticity_valid": str(elasticity.valid),
@@ -781,6 +834,15 @@ class PaperRunner:
                             int(self.state.underlyings.get("_prefiltered", 0)) + 1
                     continue
                 out.append(c)
+            if candidate_health_failures or not chain_health.valid or chain_health.warning:
+                health_for_alert = DataHealth(
+                    valid=chain_health.valid and candidate_health_failures == 0,
+                    warning=chain_health.warning or candidate_health_failures > 0,
+                    reason="; ".join(reason for reason in (chain_health.reason, *candidate_health_reasons) if reason),
+                )
+            else:
+                health_for_alert = chain_health
+            self._record_data_health_observation(und, health_for_alert, now_ist(), scope)
         return out
 
     def _refresh_lifecycle_states(self) -> None:
@@ -1730,11 +1792,14 @@ class PaperRunner:
         runtime = self.config.section("playbook_runtime")
         if not bool(runtime.get("enforce_on_paper", False)):
             self._playbook_codes_by_underlying = {}
+            self._playbook_grades_by_underlying = {}
             return
         self._playbook_codes_by_underlying = {}
+        self._playbook_grades_by_underlying = {}
         for underlying, ctx in context_map.items():
             selection = self.playbook_engine.evaluate(self._regime_context(underlying, ctx))
             self._playbook_codes_by_underlying[underlying] = selection.allowed_codes
+            self._playbook_grades_by_underlying[underlying] = selection.selected.grade.value if selection.selected is not None else ""
             self.event_ledger.append(
                 "PLAYBOOK_CONTEXT", session_id=self.state.session_id,
                 underlying=underlying, exchange=self.universe.get(underlying, {}).get("exchange", "NSE"),

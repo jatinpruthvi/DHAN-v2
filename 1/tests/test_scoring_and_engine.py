@@ -134,6 +134,11 @@ class ScoringEngineTests(unittest.TestCase):
             self.assertFalse(evaluation.eligible, field)
             self.assertTrue(any(reason in item for item in evaluation.reasons), (field, evaluation.reasons))
 
+    def test_explicit_playbook_grade_is_used_for_risk_provenance(self):
+        evaluation = OpportunityScorer(self.cfg).evaluate(replace(candidate(), setup_grade="A"))
+        self.assertEqual(evaluation.candidate.notes["setup_grade_source"], "PLAYBOOK_METADATA")
+        self.assertEqual(evaluation.candidate.notes["setup_grade_used"], "A")
+
     def test_missing_required_stop_is_fail_closed(self):
         evaluation = OpportunityScorer(self.cfg).evaluate(replace(candidate(), required_stop_points=0.0))
         self.assertFalse(evaluation.eligible)

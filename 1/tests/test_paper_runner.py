@@ -16,7 +16,7 @@ from institutional_options.fyers_parser import (
 from institutional_options.paper_runner import PaperRunner
 from institutional_options.paper_signal import PaperSignalCalculator
 from institutional_options.option_chain import OptionChainSnapshot
-from institutional_options.models import Moneyness, OptionType
+from institutional_options.models import DataHealth, Moneyness, OptionType
 
 
 CFG_PATH = "uploads/PARAMETERS.json"
@@ -224,6 +224,22 @@ class RunnerCycleTests(unittest.TestCase):
     def tearDown(self):
         self._clock.stop()
         self.tmp.cleanup()
+
+    def test_persistent_stale_data_alert_transitions_and_recovers(self):
+        runner = PaperRunner(self.cfg, RUNNER_CFG, state_dir=self.state_dir,
+                             client=FakeClient(history=history_rising()),
+                             master=make_master())
+        stale = DataHealth(False, False, "Option chain stale 31.0s")
+        runner._record_data_health_observation("NIFTY", stale, self.MARKET_NOW, "trade")
+        self.assertEqual(runner.state.underlyings["NIFTY"]["stale_data_alert"]["status"], "OBSERVING")
+        runner._record_data_health_observation("NIFTY", stale, self.MARKET_NOW + timedelta(minutes=1), "trade")
+        alert = runner.state.underlyings["NIFTY"]["stale_data_alert"]
+        self.assertEqual(alert["status"], "ALERT")
+        self.assertEqual(alert["consecutive_bad_cycles"], 2)
+        ledger_text = (self.state_dir / "research_events.csv").read_text(encoding="utf-8")
+        self.assertIn("DATA_HEALTH_ALERT", ledger_text)
+        runner._record_data_health_observation("NIFTY", DataHealth(True, False, ""), self.MARKET_NOW + timedelta(minutes=2), "trade")
+        self.assertEqual(runner.state.underlyings["NIFTY"]["stale_data_alert"]["status"], "CLEAR")
 
     def test_entry_window_uses_configured_start_and_cutoff(self):
         runner = PaperRunner(self.cfg, RUNNER_CFG, state_dir=self.state_dir,

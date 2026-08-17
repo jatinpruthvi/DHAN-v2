@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime
 from statistics import median
 from typing import Optional
@@ -195,7 +196,13 @@ class OpportunityScorer:
         reasons: list[str] = []
         gates = self._gates(candidate)
         cq = self.contract_quality.calculate(candidate, quote_stale=not candidate.data_health.valid, gates=gates)
-        setup_grade_hint = "A+" if candidate.opportunity_confidence_score >= 80 and candidate.convexity_edge_score >= 90 else "A"
+        raw_setup_grade = str(candidate.setup_grade or (candidate.notes or {}).get("setup_grade", "")).strip().upper()
+        if raw_setup_grade in {"A+", "A_PLUS", "A"}:
+            setup_grade_hint = "A+" if raw_setup_grade == "A_PLUS" else raw_setup_grade
+            setup_grade_source = "PLAYBOOK_METADATA"
+        else:
+            setup_grade_hint = "A+" if candidate.opportunity_confidence_score >= 80 and candidate.convexity_edge_score >= 90 else "A"
+            setup_grade_source = "SCORE_FALLBACK"
         risk_plan = self.risk.plan(RiskContext(
             capital=float(self.config.section("capital")["starting_capital"]),
             mode="NORMAL",
@@ -311,6 +318,7 @@ class OpportunityScorer:
         grade = self._grade(comparable, threshold, reasons)
         eligible = not reasons and grade in {OpportunityGrade.A, OpportunityGrade.A_PLUS}
         decision = self._decision(candidate, eligible, reasons)
+        candidate = replace(candidate, notes={**dict(candidate.notes or {}), "setup_grade_source": setup_grade_source, "setup_grade_used": setup_grade_hint})
         return OpportunityEvaluation(candidate, cq, risk_plan, raw, comparable, threshold, grade, eligible, decision, tuple(reasons))
 
     def _raw_opportunity_score(self, c: CandidateInputs, contract_quality_score: float) -> float:
