@@ -211,7 +211,10 @@ class EvidenceCsvTests(unittest.TestCase):
         for key in ("grade", "eligible", "decision", "direction", "convexity", "execution",
                     "confidence", "exp_req_ratio", "bid", "ask", "mid", "spread_pct", "reasons",
                     "iv_context_status", "iv_context_reason", "iv_context_source",
-                    "cost_model_valid", "canonical_promotion_allowed"):
+                    "cost_model_valid", "canonical_promotion_allowed", "depth_evidence", "depth_source",
+                    "depth_bid_levels", "depth_ask_levels", "bid_qty", "ask_qty",
+                    "cumulative_bid_qty_5depth", "cumulative_ask_qty_5depth", "quote_timestamp",
+                    "source_timestamp_available"):
             self.assertIn(key, rows[0])
         self.assertIsInstance(rows[0]["reasons"], str)
         diagnostics = list(self._csv_rows(self.dir / "candidate_diagnostics.csv"))
@@ -221,7 +224,10 @@ class EvidenceCsvTests(unittest.TestCase):
                     "gate_optimization_status", "gate_validation_observations",
                     "gate_validation_retention", "rejection_count", "rejection_reasons",
                     "iv_context_status", "iv_context_reason", "iv_context_source",
-                    "cost_model_valid", "canonical_promotion_allowed"):
+                    "cost_model_valid", "canonical_promotion_allowed", "depth_evidence", "depth_source",
+                    "depth_bid_levels", "depth_ask_levels", "bid_qty", "ask_qty",
+                    "cumulative_bid_qty_5depth", "cumulative_ask_qty_5depth", "quote_timestamp",
+                    "source_timestamp_available"):
 
             self.assertIn(key, diagnostics[0])
         # The strong call is aligned and the weak PE is wrong-sided in this

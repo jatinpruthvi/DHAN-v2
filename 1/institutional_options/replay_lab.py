@@ -86,6 +86,14 @@ class SessionReplayClient:
         rec = self._current()
         return rec.get("history", {}).get(symbol) or []
 
+    def market_depth(self, symbol: str, ohlcv_flag: int | str = 1, header: str = "") -> Any:
+        """Return captured depth or an explicit fail-closed legacy error."""
+        rec = self._current()
+        depth = rec.get("depth", {})
+        if isinstance(depth, Mapping) and symbol in depth:
+            return depth[symbol]
+        return {"s": "error", "message": "Captured depth unavailable for symbol"}
+
     def fetch_symbol_master(self, output_path: str | Path) -> Path:
         # Master is injected by replay_session; never re-download.
         p = Path(output_path)

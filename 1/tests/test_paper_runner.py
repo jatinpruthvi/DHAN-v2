@@ -1,15 +1,18 @@
 import csv
+import gzip
 import json
 import tempfile
 import time
 import unittest
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
 from institutional_options.config import SystemConfig
-from institutional_options.fyers_client import FyersInstrument, FyersSymbolMaster
+from institutional_options.fyers_client import (
+    FyersAPIError, FyersCredentials, FyersInstrument, FyersRestClient, FyersSymbolMaster, TokenStore,
+)
 from institutional_options.fyers_parser import (
     FyersOptionChainParser, parse_expiry_calendar, parse_india_vix,
 )
@@ -106,6 +109,20 @@ def history_rising(spot=25000.0, bars=15):
 
 
 class FyersParserTests(unittest.TestCase):
+    def test_numeric_fyers_symbol_uses_display_name_strike_and_ist_expiry(self):
+        expiry_ts = 1787047800  # 2026-08-18 09:00 IST
+        row = ["token", "NIFTY 18 Aug 26 24200 CE", "NSE", "65", "0.05", "", "", "", str(expiry_ts),
+               "NSE:NIFTY2681824200CE", "", "", "", "NIFTY"]
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "NSE_FO.csv"
+            path.write_text(",".join(row) + "\n", encoding="utf-8")
+            master = FyersSymbolMaster.from_csv(path, allowed_underlyings={"NIFTY"})
+        self.assertEqual(master.expiry_dates("NIFTY"), (date(2026, 8, 18),))
+        self.assertEqual(master.instruments[0].strike, 24200.0)
+        self.assertEqual(master.instruments[0].option_type, "CE")
+        self.assertEqual(master.symbol_for("NIFTY", date(2026, 8, 18), 24200, "CE"),
+                         "NSE:NIFTY2681824200CE")
+
     def test_bse_symbol_master_rows_are_parsed_when_requested(self):
         expiry_ts = 1787652600
         rows = []
@@ -150,6 +167,145 @@ class FyersParserTests(unittest.TestCase):
     def test_parse_raises_on_bad_payload(self):
         with self.assertRaises(Exception):
             FyersOptionChainParser.parse({"data": {}}, "NIFTY", "2026-08-25")
+
+
+class DepthFakeClient(FakeClient):
+    def __init__(self, depth_payload=None, **kwargs):
+        super().__init__(**kwargs)
+        self.depth_payload = depth_payload or self._default_depth()
+        self.depth_calls = []
+
+    @staticmethod
+    def _default_depth():
+        return {
+            "s": "ok",
+            "d": {
+                "__SYMBOL__": {
+                    "bids": [{"price": 99.0 - i * 0.05, "volume": 100 + i * 50, "ord": i + 1} for i in range(5)],
+                    "ask": [{"price": 100.0 + i * 0.05, "volume": 150 + i * 50, "ord": i + 1} for i in range(5)],
+                    "ltp": 99.5,
+                    "ltt": int(datetime(2026, 8, 12, 10, 0, tzinfo=timezone.utc).timestamp()),
+                },
+            },
+        }
+
+    def market_depth(self, symbol, ohlcv_flag=1, header=""):
+        self.depth_calls.append((symbol, ohlcv_flag))
+        raw = json.loads(json.dumps(self.depth_payload).replace("__SYMBOL__", symbol))
+        return raw
+
+
+class FyersDepthTests(unittest.TestCase):
+    def test_market_depth_client_uses_read_only_depth_route(self):
+        with tempfile.TemporaryDirectory() as td:
+            client = FyersRestClient(
+                FyersCredentials("APP-100", "secret"),
+                TokenStore(Path(td) / "tokens.json"),
+                timeout=7,
+            )
+            with mock.patch("institutional_options.fyers_client._req", return_value=(200, {"s": "ok"})) as req:
+                result = client.market_depth("NSE:NIFTY2681824200CE", header="APP-100:token")
+                cached = client.market_depth("NSE:NIFTY2681824200CE", header="APP-100:token")
+            self.assertEqual(result, {"s": "ok"})
+            self.assertEqual(cached, result)
+            self.assertEqual(req.call_count, 1)
+            self.assertEqual(client.depth_stats()["cache_hits"], 1)
+            url = req.call_args.args[0]
+            self.assertIn("https://api-t1.fyers.in/data/depth?", url)
+            self.assertIn("symbol=NSE%3ANIFTY2681824200CE", url)
+            self.assertIn("ohlcv_flag=1", url)
+            self.assertEqual(req.call_args.kwargs["auth_header"], "APP-100:token")
+
+    def test_market_depth_retries_429_and_records_stats(self):
+        with tempfile.TemporaryDirectory() as td:
+            client = FyersRestClient(
+                FyersCredentials("APP-100", "secret"),
+                TokenStore(Path(td) / "tokens.json"),
+                timeout=7,
+            )
+            with mock.patch("institutional_options.fyers_client._req", side_effect=[
+                FyersAPIError("rate limited", status_code=429),
+                (200, {"s": "ok"}),
+            ]) as req, mock.patch("institutional_options.fyers_client.time.sleep"):
+                self.assertEqual(client.market_depth("NSE:NIFTY2681824200CE", header="h"), {"s": "ok"})
+            self.assertEqual(req.call_count, 2)
+            stats = client.depth_stats()
+            self.assertEqual(stats["rate_limit_hits"], 1)
+            self.assertEqual(stats["retries"], 1)
+            self.assertEqual(stats["successes"], 1)
+            self.assertEqual(stats["errors"], 0)
+
+    def test_runner_keeps_malformed_depth_fail_closed(self):
+        cfg = SystemConfig.from_file(CFG_PATH)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        malformed = {"s": "ok", "d": {"__SYMBOL__": {"bids": [], "ask": [], "ltt": 0}}}
+        client = DepthFakeClient(depth_payload=malformed, history=history_rising())
+        runner = PaperRunner(cfg, RUNNER_CFG, state_dir=Path(tmp.name), client=client, master=make_master())
+        payload = make_chain_payload()
+        chain = FyersOptionChainParser.parse(payload, "NIFTY", "2026-08-25", datetime(2026, 8, 12, 10, 0))
+        enriched = runner._enrich_fyers_depth("NIFTY", chain, payload)
+        leg = enriched.leg_at(25000.0, OptionType.CE)
+        self.assertEqual(leg.quote.bid_qty, 0)
+        self.assertEqual(leg.quote.ask_qty, 0)
+        self.assertEqual(leg.quote.cumulative_bid_qty_5depth, None)
+        self.assertEqual(runner.state.underlyings["NIFTY"]["depth_health"]["status"], "UNAVAILABLE")
+        self.assertGreater(runner.state.underlyings["NIFTY"]["depth_health"]["failed_legs"], 0)
+
+    def test_runner_enriches_top_book_and_five_level_depth(self):
+        cfg = SystemConfig.from_file(CFG_PATH)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        client = DepthFakeClient(history=history_rising())
+        runner = PaperRunner(cfg, RUNNER_CFG, state_dir=Path(tmp.name), client=client, master=make_master())
+        payload = make_chain_payload()
+        chain = FyersOptionChainParser.parse(payload, "NIFTY", "2026-08-25", datetime(2026, 8, 12, 10, 0))
+        enriched = runner._enrich_fyers_depth("NIFTY", chain, payload)
+        leg = enriched.leg_at(25000.0, OptionType.CE)
+        self.assertEqual(leg.quote.bid_qty, 100)
+        self.assertEqual(leg.quote.ask_qty, 150)
+        self.assertEqual(leg.quote.cumulative_bid_qty_5depth, 100 + 150 + 200 + 250 + 300)
+        self.assertEqual(leg.quote.cumulative_ask_qty_5depth, 150 + 200 + 250 + 300 + 350)
+        self.assertTrue(leg.quote.source_timestamp_available)
+        self.assertEqual(leg.source_timestamp, datetime(2026, 8, 12, 10, 0, tzinfo=timezone.utc))
+        self.assertEqual(runner.state.underlyings["NIFTY"]["depth_health"]["successful_legs"], 6)
+        self.assertEqual(len(client.depth_calls), 6)
+
+    def test_runner_does_not_mark_zero_filled_levels_as_five_level_evidence(self):
+        cfg = SystemConfig.from_file(CFG_PATH)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        raw = DepthFakeClient._default_depth()
+        raw["d"]["__SYMBOL__"]["ask"][1:] = [{"price": 0.0, "volume": 0, "ord": 0} for _ in range(4)]
+        client = DepthFakeClient(depth_payload=raw, history=history_rising())
+        runner = PaperRunner(cfg, RUNNER_CFG, state_dir=Path(tmp.name), client=client, master=make_master())
+        payload = make_chain_payload()
+        chain = FyersOptionChainParser.parse(payload, "NIFTY", "2026-08-25", datetime(2026, 8, 12, 10, 0))
+        enriched = runner._enrich_fyers_depth("NIFTY", chain, payload)
+        leg = enriched.leg_at(25000.0, OptionType.CE)
+        self.assertGreater(leg.quote.bid_qty, 0)
+        self.assertGreater(leg.quote.ask_qty, 0)
+        self.assertIsNone(leg.quote.cumulative_bid_qty_5depth)
+        self.assertIsNone(leg.quote.cumulative_ask_qty_5depth)
+        self.assertEqual(runner.state.underlyings["NIFTY"]["depth_health"]["five_level_legs"], 0)
+
+    def test_runner_rejects_zero_best_quote_and_records_reason(self):
+        cfg = SystemConfig.from_file(CFG_PATH)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        raw = DepthFakeClient._default_depth()
+        raw["d"]["__SYMBOL__"]["ask"][0] = {"price": 0.0, "volume": 0, "ord": 0}
+        client = DepthFakeClient(depth_payload=raw, history=history_rising())
+        runner = PaperRunner(cfg, RUNNER_CFG, state_dir=Path(tmp.name), client=client, master=make_master())
+        payload = make_chain_payload()
+        chain = FyersOptionChainParser.parse(payload, "NIFTY", "2026-08-25", datetime(2026, 8, 12, 10, 0))
+        enriched = runner._enrich_fyers_depth("NIFTY", chain, payload)
+        leg = enriched.leg_at(25000.0, OptionType.CE)
+        self.assertEqual(leg.quote.bid_qty, 0)
+        self.assertEqual(leg.quote.ask_qty, 0)
+        health = runner.state.underlyings["NIFTY"]["depth_health"]
+        self.assertEqual(health["status"], "UNAVAILABLE")
+        self.assertTrue(any("best quote invalid" in reason for reason in health["failure_reasons"]))
 
 
 class SignalProxyTests(unittest.TestCase):
@@ -280,6 +436,20 @@ class RunnerCycleTests(unittest.TestCase):
         self.assertEqual(runner._select_expiry("SENSEX", calendar, True), "2026-08-25")
         self.assertEqual(runner._select_expiry("NIFTY", calendar, False), "2026-08-18")
 
+    def test_missing_options_chain_is_explicitly_unavailable_and_fail_closed(self):
+        cfg = SystemConfig.from_file(CFG_PATH)
+        cfg_runner = {**RUNNER_CFG, "underlyings": {
+            "NIFTY": {"index_symbol": "NSE:NIFTY50-INDEX", "prefer_monthly": False},
+        }}
+        client = FakeClient(payloads={"NSE:NIFTY50-INDEX": {"s": "ok", "data": {}}})
+        runner = PaperRunner(cfg, cfg_runner, state_dir=self.state_dir, client=client, master=make_master())
+        with self.assertRaises(RuntimeError):
+            runner.run_one_cycle()
+        health = runner.state.underlyings["NIFTY"]["chain_health"]
+        self.assertEqual(health["status"], "UNAVAILABLE")
+        self.assertEqual(health["reason_code"], "OPTIONS_CHAIN_UNAVAILABLE")
+        self.assertTrue(health["fail_closed"])
+
     def test_monitor_rotation_keeps_trade_universe_always_present(self):
         cfg = json.loads(Path("uploads/PAPER_RUNNER.json").read_text(encoding="utf-8"))
         cfg["monitoring"]["monitor_poll_seconds"] = 0
@@ -391,6 +561,19 @@ class RunnerCycleTests(unittest.TestCase):
         for c in cands:
             self.assertGreater(c["premium_elasticity"], 0)
         self.assertTrue(snap["last_cycle_ok"])
+
+    def test_capture_cycle_persists_depth_payloads(self):
+        cfg = {**RUNNER_CFG, "capture": True}
+        runner = PaperRunner(self.cfg, cfg, state_dir=self.state_dir,
+                             client=FakeClient(history=history_rising()), master=make_master())
+        depth = {"NSE:NIFTY26AUG25000CE": {"s": "ok", "d": {}}}
+        runner._capture_cycle({"NSE:NIFTY50-INDEX": make_chain_payload()}, {}, self.MARKET_NOW, depth)
+        runner._capture_file.close()
+        captures = list((self.state_dir / "sessions").glob("*.jsonl.gz"))
+        self.assertEqual(len(captures), 1)
+        with gzip.open(captures[0], "rt", encoding="utf-8") as handle:
+            record = json.loads(handle.readline())
+        self.assertEqual(record["depth"], depth)
 
     def test_snapshot_serializes(self):
         client = FakeClient(history=history_rising())

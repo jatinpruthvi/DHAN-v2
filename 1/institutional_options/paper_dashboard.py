@@ -13,9 +13,23 @@ realized P&L, and an equity curve (inline SVG). All rendering is vanilla JS.
 from __future__ import annotations
 
 import json
+import math
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Callable
+from typing import Any, Callable
+
+
+def _json_safe(value: Any) -> Any:
+    """Recursively replace non-finite floats with None so the served state is
+    valid strict JSON (Python's json.dumps emits bare Infinity/NaN otherwise,
+    which the browser JSON.parse rejects)."""
+    if isinstance(value, float):
+        return None if not math.isfinite(value) else value
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    return value
 
 PAGE = r"""<!DOCTYPE html>
 <html lang="en">
@@ -162,7 +176,12 @@ function renderChains(uds) {
   el.innerHTML = '';
   for (const [und, d] of Object.entries(uds)) {
     if (und.startsWith('_')) continue;
-    if (d.error) { el.innerHTML += `<div class="chain-panel"><h3>${esc(und)}</h3><span class="err">${esc(d.error)}</span></div>`; continue; }
+    if (d.error) {
+      const ch = d.chain_health || {};
+      const reason = ch.reason_code ? ` [${esc(ch.reason_code)}]` : '';
+      el.innerHTML += `<div class="chain-panel"><h3>${esc(und)}</h3><span class="err">${esc(d.error)}${reason}</span><div class="muted" style="font-size:11px;margin-top:5px">fail-closed: ${ch.fail_closed === false ? 'no' : 'yes'}</div></div>`;
+      continue;
+    }
     let rows = `<div class="strike-row head"><span>Strike</span><span>CE bid/ask</span><span></span><span>PE bid/ask</span><span>spot ${fmt(d.spot,1)}</span></div>`;
     for (const s of (d.strikes || [])) {
       const ce = s.ce ? fmt(s.ce.bid,1)+' / '+fmt(s.ce.ask,1) : '—';
@@ -170,7 +189,9 @@ function renderChains(uds) {
       const marker = s.atm ? '◄' : '';
       rows += `<div class="strike-row"><span>${fmt(s.strike,0)} ${marker}</span><span>${ce}</span><span></span><span>${pe}</span><span></span></div>`;
     }
-    const meta = `VIX ${d.vix!=null?fmt(d.vix,1):'—'} · exp ${esc(d.expiry)} · dte ${fmt(d.dte,1)} · dir ${fmt(d.direction,0)} · TQ ${fmt(d.trade_quality,0)} · host ${fmt(d.hostility,0)} · reqMove ${fmt(d.required_move,0)} · ATR1 ${fmt(d.atr1,2)} · eff ${fmt(d.trend_eff,0)}`;
+    const dh = d.depth_health || {};
+    const depth = `depth ${esc(dh.status || '—')} ${dh.successful_legs ?? 0}/${dh.requested_legs ?? 0} · 5L ${dh.five_level_legs ?? 0} · 429 ${dh.rate_limit_errors ?? 0}`;
+    const meta = `VIX ${d.vix!=null?fmt(d.vix,1):'—'} · exp ${esc(d.expiry)} · dte ${fmt(d.dte,1)} · dir ${fmt(d.direction,0)} · TQ ${fmt(d.trade_quality,0)} · host ${fmt(d.hostility,0)} · reqMove ${fmt(d.required_move,0)} · ATR1 ${fmt(d.atr1,2)} · eff ${fmt(d.trend_eff,0)} · ${depth}`;
     el.innerHTML += `<div class="chain-panel"><h3>${esc(und)}</h3><div class="muted" style="font-size:11px;margin-bottom:6px">${meta}</div>${rows}</div>`;
   }
 }
@@ -223,7 +244,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):  # noqa: N802 (stdlib naming)
         if self.path.startswith("/state.json"):
-            body = json.dumps(self.snapshot_fn()).encode("utf-8")
+            body = json.dumps(_json_safe(self.snapshot_fn())).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Cache-Control", "no-store")

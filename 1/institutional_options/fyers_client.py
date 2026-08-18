@@ -5,6 +5,7 @@ Implements the endpoints validated against the live Fyers API:
   * POST /api/v3/validate-authcode      auth-code -> access + refresh token
   * POST /api/v3/validate-refresh-token refresh token -> new access token
   * GET  /data/options-chain-v3         option chain + expiry calendar + VIX
+  * GET  /data/depth                     read-only multi-level market depth
   * GET  /data/quotes                   quotes for up to 50 symbols
   * GET  /data/history                  historical candles
   * GET  https://public.fyers.in/sym_details/NSE_FO.csv  symbol master (no auth)
@@ -38,12 +39,15 @@ from typing import Any, Mapping, Optional
 AUTH_BASE = "https://api-t1.fyers.in/api/v3"
 DATA_BASE = "https://api-t1.fyers.in/data"
 SYMBOL_MASTER_URL = "https://public.fyers.in/sym_details/NSE_FO.csv"
+IST = timezone(timedelta(hours=5, minutes=30))
 REDIRECT_URI = "https://trade.fyers.in/api-login/redirect-uri/index.html"
 UA = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
 
 
 class FyersAPIError(RuntimeError):
-    pass
+    def __init__(self, message: str, status_code: Optional[int] = None):
+        super().__init__(message)
+        self.status_code = status_code
 
 
 @dataclass(frozen=True)
@@ -128,7 +132,7 @@ def _req(url: str, method: str = "GET", body: Optional[Mapping[str, Any]] = None
                 return resp.status, raw[:500].decode("utf-8", "replace")
     except urllib.error.HTTPError as e:
         detail = e.read().decode("utf-8", "replace")[:500]
-        raise FyersAPIError(f"Fyers HTTP {e.code} on {url}: {detail}") from e
+        raise FyersAPIError(f"Fyers HTTP {e.code} on {url}: {detail}", status_code=e.code) from e
     except urllib.error.URLError as e:
         raise FyersAPIError(f"Fyers URL error on {url}: {e}") from e
 
@@ -149,6 +153,20 @@ class FyersRestClient:
         self.tokens.load()
         self.timeout = timeout
         self._auth_header = ""
+        self._depth_last_request_at = 0.0
+        self._depth_min_interval_sec = 0.10
+        self._depth_backoff_sec = (0.50, 1.00)
+        self._depth_cache_ttl_sec = 0.50
+        self._depth_cache: dict[str, tuple[float, Any]] = {}
+        self._depth_stats = {
+            "requests": 0,
+            "successes": 0,
+            "errors": 0,
+            "rate_limit_hits": 0,
+            "retries": 0,
+            "cache_hits": 0,
+            "last_error": "",
+        }
 
     # -- session management ---------------------------------------------------
 
@@ -258,6 +276,45 @@ class FyersRestClient:
         status, resp = _req(url, auth_header=header or self._auth_header, timeout=self.timeout)
         return resp
 
+    def market_depth(self, symbol: str, ohlcv_flag: int | str = 1, header: str = "") -> Any:
+        """Return read-only Fyers market depth with bounded pacing and 429 retry."""
+        if not str(symbol or "").strip():
+            raise FyersAPIError("Market depth requires a Fyers symbol")
+        symbol = str(symbol).strip()
+        now_monotonic = time.monotonic()
+        cached = self._depth_cache.get(symbol)
+        if cached is not None and now_monotonic - cached[0] <= self._depth_cache_ttl_sec:
+            self._depth_stats["cache_hits"] += 1
+            return cached[1]
+        params = urllib.parse.urlencode({"symbol": symbol, "ohlcv_flag": str(ohlcv_flag)})
+        url = f"{DATA_BASE}/depth?{params}"
+        for attempt in range(3):
+            wait = self._depth_min_interval_sec - (time.monotonic() - self._depth_last_request_at)
+            if wait > 0:
+                time.sleep(wait)
+            self._depth_last_request_at = time.monotonic()
+            self._depth_stats["requests"] += 1
+            try:
+                status, resp = _req(url, auth_header=header or self._auth_header, timeout=self.timeout)
+                self._depth_stats["successes"] += 1
+                self._depth_stats["last_error"] = ""
+                if isinstance(resp, Mapping) and str(resp.get("s", "")).lower() == "ok":
+                    self._depth_cache[symbol] = (time.monotonic(), resp)
+                return resp
+            except FyersAPIError as exc:
+                if exc.status_code == 429 and attempt < 2:
+                    self._depth_stats["rate_limit_hits"] += 1
+                    self._depth_stats["retries"] += 1
+                    time.sleep(self._depth_backoff_sec[attempt])
+                    continue
+                self._depth_stats["errors"] += 1
+                self._depth_stats["last_error"] = str(exc)[:300]
+                raise
+        raise FyersAPIError("Fyers depth request exhausted retry budget")
+
+    def depth_stats(self) -> dict[str, Any]:
+        return dict(self._depth_stats)
+
     def history(self, symbol: str, resolution: str = "1",
                 range_from: str | int = "", range_to: str | int = "",
                 cont_flag: str = "1", header: str = "") -> Any:
@@ -356,8 +413,10 @@ class FyersSymbolMaster:
                     tick = float(row[cls.COL_TICK])
                 except (ValueError, IndexError):
                     continue
-                expiry_date = datetime.fromtimestamp(expiry_ts).date()
-                strike, opt = cls._parse_option_symbol(sym)
+                expiry_date = datetime.fromtimestamp(expiry_ts, timezone.utc).astimezone(IST).date()
+                display_name = row[1].strip() if len(row) > 1 else ""
+                strike, opt = cls._parse_option_symbol(sym, display_name)
+
                 out.append(FyersInstrument(sym, row[0], underlying, expiry_date, expiry_ts,
                                            strike, opt, lot, tick))
         return cls(out)
@@ -370,18 +429,31 @@ class FyersSymbolMaster:
         return cls(instruments)
 
     @staticmethod
-    def _parse_option_symbol(sym: str) -> tuple[Optional[float], Optional[str]]:
-        # Fyers option symbols: NSE:NIFTY26AUG5000CE / NSE:BANKNIFTY26AUG50000PE
-        body = sym[4:]
-        if body.endswith("CE") or body.endswith("PE"):
+    def _parse_option_symbol(sym: str, display_name: str = "") -> tuple[Optional[float], Optional[str]]:
+        """Parse option metadata without treating encoded expiry digits as strike.
+
+        Current Fyers numeric symbols look like ``NIFTY2681824200CE`` where the
+        date prefix and strike are concatenated.  The symbol alone is ambiguous;
+        the public symbol master display-name column is the authoritative source
+        for the strike, e.g. ``NIFTY 18 Aug 26 24200 CE``.
+        """
+        import re
+
+        display = str(display_name or "").strip().upper()
+        match = re.search(r"(\d+(?:\.\d+)?)\s+(CE|PE)\s*$", display)
+        if match:
+            return float(match.group(1)), match.group(2)
+
+        body = str(sym or "").split(":", 1)[-1].upper()
+        if body.endswith(("CE", "PE")):
             opt = body[-2:]
-            digits = "".join(ch for ch in body[:-2] if ch.isdigit())
-            # strike is the trailing digits that do not belong to the yymon code.
-            import re
-            m = re.search(r"(\d{5,})$", body[:-2])
-            if m:
-                return float(m.group(1)), opt
-            return (float(digits[-6:]) if digits else None), opt
+            body_without_opt = body[:-2]
+            # Alpha-month symbols such as NIFTY26AUG24200CE are unambiguous.
+            match = re.search(r"\d{2}[A-Z]{3}(\d+(?:\.\d+)?)$", body_without_opt)
+            if match:
+                return float(match.group(1)), opt
+            # Do not guess from a numeric date+strike symbol.  The display name
+            # should be present in a valid symbol master row.
         return None, None
 
     def expiry_dates(self, underlying: str) -> tuple[date, ...]:

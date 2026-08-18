@@ -21,6 +21,7 @@ import csv
 import gzip
 import hashlib
 import json
+import math
 import os
 import shutil
 import threading
@@ -45,7 +46,7 @@ from .lifecycle import (
 from .models import DataHealth, OptionType, PaperFill, PaperTrade, Quote, TradeDecision
 from .market_metrics import PortfolioNoTradeCalculator
 from .observed_metrics import RollingPremiumElasticity
-from .option_chain import OptionChainSnapshot
+from .option_chain import OptionChainSnapshot, OptionLeg, OptionStrike
 from .playbooks import RegimeContext, RegimeLabel, RegimePlaybookSelectionEngine
 from .surface_diagnostics import OptionSurfaceDiagnostics
 from .paper_evidence import PaperEvidenceCollector
@@ -556,6 +557,8 @@ class PaperRunner:
         context_map = {}
         payloads: dict[str, Any] = {}
         histories: dict[str, Any] = {}
+        depth_payloads: dict[str, Any] = {}
+        self._depth_payloads = depth_payloads
         for und in self._cycle_underlyings():
             meta = self.universe[und]
             try:
@@ -563,6 +566,7 @@ class PaperRunner:
                 cal = parse_expiry_calendar(payload)
                 expiry = self._select_expiry(und, cal, bool(meta.get("prefer_monthly", False)))
                 chain = FyersOptionChainParser.parse(payload, und, expiry, now)
+                chain = self._enrich_fyers_depth(und, chain, payload)
                 vix = parse_india_vix(payload)
                 chains[und] = chain
                 vix_map[und] = vix
@@ -575,12 +579,23 @@ class PaperRunner:
                     direction_model_inputs=direction_inputs,
                 )
             except Exception as e:
-                self.state.underlyings[und] = {"error": f"{type(e).__name__}: {e}"}
-                self._log(f"  {und} chain error: {e}")
+                detail = f"{type(e).__name__}: {e}"
+                reason_code = "OPTIONS_CHAIN_UNAVAILABLE" if "optionsChain" in str(e) else "OPTIONS_CHAIN_ERROR"
+                self.state.underlyings[und] = {
+                    "error": detail,
+                    "chain_health": {
+                        "source": "FYERS_OPTIONS_CHAIN",
+                        "status": "UNAVAILABLE",
+                        "reason_code": reason_code,
+                        "detail": detail,
+                        "fail_closed": True,
+                    },
+                }
+                self._log(f"  {und} chain unavailable [{reason_code}]: {detail}")
         if not chains:
             raise RuntimeError("No underlying chains fetched this cycle.")
         if self._capture_file is not None:
-            self._capture_cycle(payloads, histories, now)
+            self._capture_cycle(payloads, histories, now, depth_payloads)
         self._update_playbook_filters(context_map, now)
         self.state.underlyings["_risk_context"] = dict(self._risk_context)
         for und, chain in chains.items():
@@ -698,6 +713,193 @@ class PaperRunner:
                 )
         target["stale_data_alert"] = alert
 
+    def _enrich_fyers_depth(self, underlying: str, chain: OptionChainSnapshot, payload: Mapping[str, Any]) -> OptionChainSnapshot:
+        """Merge read-only Fyers depth into the bounded candidate strikes.
+
+        The option-chain endpoint supplies broad strike coverage but omits
+        quantities.  Fyers' separate `/data/depth` endpoint supplies the exact
+        symbol's level-one and five-level book.  We request depth only for the
+        nearest three strikes (the same bounded set used by CandidateFactory),
+        preserving all-59 chain collection while avoiding an unbounded request
+        fan-out.  Any missing or malformed depth remains invalid rather than
+        being inferred.
+        """
+        depth_method = getattr(self.client, "market_depth", None)
+        if not callable(depth_method):
+            self.state.underlyings.setdefault(underlying, {})["depth_health"] = {
+                "source": "FYERS_MARKET_DEPTH",
+                "status": "UNAVAILABLE",
+                "reason": "Depth client method unavailable",
+                "requested_legs": 0,
+                "successful_legs": 0,
+                "failed_legs": 0,
+                "five_level_legs": 0,
+            }
+            return chain
+        raw_data = payload.get("data", {}) if isinstance(payload, Mapping) else {}
+        raw_rows = raw_data.get("optionsChain", []) if isinstance(raw_data, Mapping) else []
+        symbols: dict[tuple[float, str], str] = {}
+        for raw in raw_rows:
+            if not isinstance(raw, Mapping):
+                continue
+            option_type = str(raw.get("option_type", "")).upper()
+            raw_symbol = str(raw.get("symbol", "")).strip()
+            try:
+                strike = float(raw.get("strike_price"))
+            except (TypeError, ValueError):
+                continue
+            if option_type in {"CE", "PE"} and strike > 0 and raw_symbol:
+                symbols[(strike, option_type)] = raw_symbol
+        target_strikes = set(sorted((s.strike for s in chain.strikes), key=lambda strike: abs(strike - chain.nearest_strike()))[:3])
+        requested = successful = five_level = failed = 0
+        rate_limit_errors = api_errors = 0
+        last_error = ""
+        failure_reasons: list[str] = []
+
+        def _levels(raw: Any, side: str) -> list[dict[str, float]]:
+            if not isinstance(raw, list) or not raw:
+                raise ValueError(f"Fyers depth {side} levels missing")
+            out: list[dict[str, float]] = []
+            for index, item in enumerate(raw):
+                if not isinstance(item, Mapping):
+                    raise ValueError(f"Fyers depth {side}[{index}] malformed")
+                try:
+                    price = float(item.get("price", 0.0))
+                    volume = float(item.get("volume", 0.0))
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(f"Fyers depth {side}[{index}] numeric fields invalid") from exc
+                if not math.isfinite(price) or not math.isfinite(volume) or volume < 0:
+                    raise ValueError(f"Fyers depth {side}[{index}] numeric fields invalid")
+                out.append({"price": price, "volume": volume})
+            return out
+
+        def _optional_int(raw: Any, fallback: int) -> int:
+            if raw in (None, ""):
+                return fallback
+            try:
+                value = float(raw)
+                return int(value) if math.isfinite(value) and value >= 0 else fallback
+            except (TypeError, ValueError):
+                return fallback
+
+        def _optional_float(raw: Any, fallback: Optional[float]) -> Optional[float]:
+            if raw in (None, ""):
+                return fallback
+            try:
+                value = float(raw)
+                return value if math.isfinite(value) else fallback
+            except (TypeError, ValueError):
+                return fallback
+
+        enriched_strikes: list[OptionStrike] = []
+        for strike in chain.strikes:
+            if strike.strike not in target_strikes:
+                enriched_strikes.append(strike)
+                continue
+            legs: list[tuple[str, Optional[OptionLeg]]] = [("CE", strike.ce), ("PE", strike.pe)]
+            new_legs: dict[str, Optional[OptionLeg]] = {}
+            for side, leg in legs:
+                if leg is None:
+                    new_legs[side] = None
+                    continue
+                symbol = symbols.get((strike.strike, side), "")
+                if not symbol:
+                    new_legs[side] = leg
+                    failed += 1
+                    failure_reasons.append(f"{side}@{strike.strike}: depth symbol missing")
+                    continue
+                requested += 1
+                try:
+                    depth_payload = depth_method(symbol, ohlcv_flag=1)
+                    if hasattr(self, "_depth_payloads"):
+                        self._depth_payloads[symbol] = depth_payload
+                    depth_data = depth_payload.get("d", {}) if isinstance(depth_payload, Mapping) else {}
+                    depth = depth_data.get(symbol, {}) if isinstance(depth_data, Mapping) else {}
+                    if not isinstance(depth, Mapping):
+                        raise ValueError("Fyers depth symbol payload missing")
+                    bids = _levels(depth.get("bids", []), "bid")
+                    asks = _levels(depth.get("ask", depth.get("asks", [])), "ask")
+                    best_bid = bids[0]
+                    best_ask = asks[0]
+                    bid = best_bid["price"]
+                    ask = best_ask["price"]
+                    bid_qty = int(best_bid["volume"])
+                    ask_qty = int(best_ask["volume"])
+                    if bid <= 0 or ask <= 0 or ask <= bid or bid_qty <= 0 or ask_qty <= 0:
+                        raise ValueError("Fyers depth best quote invalid")
+                    ltt = depth.get("ltt")
+                    if ltt in (None, ""):
+                        raise ValueError("Fyers depth source timestamp missing")
+                    ltt_seconds = float(ltt)
+                    if not math.isfinite(ltt_seconds) or ltt_seconds <= 0:
+                        raise ValueError("Fyers depth source timestamp invalid")
+                    depth_timestamp = datetime.fromtimestamp(ltt_seconds, timezone.utc)
+                    valid_five_bid = len(bids) >= 5 and all(level["price"] > 0 and level["volume"] > 0 for level in bids[:5])
+                    valid_five_ask = len(asks) >= 5 and all(level["price"] > 0 and level["volume"] > 0 for level in asks[:5])
+                    if valid_five_bid and valid_five_ask:
+                        cumulative_bid = int(sum(level["volume"] for level in bids[:5]))
+                        cumulative_ask = int(sum(level["volume"] for level in asks[:5]))
+                        five_level += 1
+                    else:
+                        cumulative_bid = cumulative_ask = None
+                    last = _optional_float(depth.get("ltp"), leg.quote.last)
+                    quote = replace(
+                        leg.quote,
+                        bid=bid,
+                        ask=ask,
+                        bid_qty=bid_qty,
+                        ask_qty=ask_qty,
+                        last=last,
+                        timestamp=depth_timestamp,
+                        cumulative_bid_qty_5depth=cumulative_bid,
+                        cumulative_ask_qty_5depth=cumulative_ask,
+                        source_timestamp_available=True,
+                    )
+                    depth_oi = _optional_int(depth.get("oi"), leg.oi)
+                    depth_volume = _optional_int(depth.get("v"), leg.volume)
+                    new_legs[side] = replace(
+                        leg,
+                        quote=quote,
+                        source_timestamp=depth_timestamp,
+                        oi=depth_oi,
+                        volume=depth_volume,
+                    )
+                    successful += 1
+                except Exception as exc:
+                    failed += 1
+                    if getattr(exc, "status_code", None) == 429:
+                        rate_limit_errors += 1
+                    else:
+                        api_errors += 1
+                    last_error = f"{type(exc).__name__}: {str(exc)[:180]}"
+                    failure_reasons.append(f"{symbol}: {last_error}")
+                    new_legs[side] = leg
+                    self._log(f"  {underlying} {symbol} depth unavailable: {last_error}")
+            enriched_strikes.append(OptionStrike(strike.strike, new_legs["CE"], new_legs["PE"]))
+        client_stats = {}
+        stats_method = getattr(self.client, "depth_stats", None)
+        if callable(stats_method):
+            try:
+                client_stats = stats_method()
+            except Exception:
+                client_stats = {}
+        status = "APPLIED" if successful and not failed else "PARTIAL" if successful else "UNAVAILABLE"
+        self.state.underlyings.setdefault(underlying, {})["depth_health"] = {
+            "source": "FYERS_MARKET_DEPTH",
+            "status": status,
+            "requested_legs": requested,
+            "successful_legs": successful,
+            "failed_legs": failed,
+            "five_level_legs": five_level,
+            "rate_limit_errors": rate_limit_errors,
+            "api_errors": api_errors,
+            "last_error": last_error,
+            "failure_reasons": failure_reasons[-20:],
+            "client_stats": client_stats,
+            "candidate_strikes": sorted(target_strikes),
+        }
+        return replace(chain, strikes=tuple(enriched_strikes))
+
     def _build_candidates(self, chains, context_map, scope: str = "trade") -> list:
         if scope not in {"trade", "monitor"}:
             raise ValueError(f"Unsupported candidate build scope: {scope}")
@@ -801,6 +1003,14 @@ class PaperRunner:
                     "gate_spread_pct_max": active_gates.spread_pct_max,
                     "gate_min_top_book_lots": active_gates.min_top_book_lots,
                     "gate_min_5depth_lots_each_side": active_gates.min_5depth_lots_each_side,
+                    "depth_evidence": (
+                        "FIVE_LEVEL" if c.quote.cumulative_bid_qty_5depth is not None and c.quote.cumulative_ask_qty_5depth is not None
+                        else "TOP_BOOK_ONLY" if c.quote.bid_qty > 0 and c.quote.ask_qty > 0
+                        else "UNAVAILABLE"
+                    ),
+                    "depth_source": "FYERS_MARKET_DEPTH" if c.quote.source_timestamp_available else "UNAVAILABLE",
+                    "depth_bid_levels": 5 if c.quote.cumulative_bid_qty_5depth is not None else 0,
+                    "depth_ask_levels": 5 if c.quote.cumulative_ask_qty_5depth is not None else 0,
                     "gate_resolution_path": active_gates.gate_resolution_path,
                     "gate_optimization_method": active_gates.gate_optimization_method,
                     "gate_optimization_status": active_gates.gate_optimization_status,
@@ -1579,7 +1789,8 @@ class PaperRunner:
             exchange = meta.get("exchange", "NSE")
             instrument_class = class_for_metadata(exchange, instrument_kind)
             class_gates = self.calibration.gates_for(instrument_class)
-            self.state.underlyings[und] = {
+            prior_state = dict(self.state.underlyings.get(und, {}) or {})
+            display_state = {
                 "exchange": exchange,
                 "instrument_kind": instrument_kind,
                 "instrument_class": instrument_class,
@@ -1604,6 +1815,10 @@ class PaperRunner:
                 "trend_eff": round(ctx.trend_efficiency, 1),
                 "strikes": legs,
             }
+            for preserved_key in ("depth_health", "stale_data_alert", "instrument_error", "promotion"):
+                if preserved_key in prior_state:
+                    display_state[preserved_key] = prior_state[preserved_key]
+            self.state.underlyings[und] = display_state
 
     def _update_candidate_display(self, result, key: str = "_candidates") -> None:
         rows = []
@@ -1642,12 +1857,17 @@ class PaperRunner:
         if len(self.state.equity) > 5000:
             self.state.equity = self.state.equity[-5000:]
 
-    def _capture_cycle(self, payloads: dict, histories: dict, now: datetime) -> None:
-        """Append one cycle of raw chain/history payloads to the session capture
-        file (paper_state/sessions/<session>.jsonl.gz) for offline replay and
-        parameter sweeps."""
+    def _capture_cycle(self, payloads: dict, histories: dict, now: datetime,
+                       depth_payloads: Optional[dict] = None) -> None:
+        """Append one cycle of raw chain/history/depth payloads to the session
+        capture file for deterministic offline replay and parameter sweeps."""
         try:
-            rec = {"ts": now.isoformat(), "chains": payloads, "history": histories}
+            rec = {
+                "ts": now.isoformat(),
+                "chains": payloads,
+                "history": histories,
+                "depth": depth_payloads or {},
+            }
             self._capture_file.write(json.dumps(rec, default=str) + "\n")
             self._capture_file.flush()
         except Exception as e:
