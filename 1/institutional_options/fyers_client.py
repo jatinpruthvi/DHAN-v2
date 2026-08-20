@@ -84,7 +84,7 @@ class TokenStore:
         if not p.exists():
             return
         try:
-            raw = json.loads(p.read_text(encoding="utf-8"))
+            raw = json.loads(p.read_text(encoding="utf-8-sig"))
             self.access_token = raw.get("access_token", "")
             self.refresh_token = raw.get("refresh_token", "")
             self.updated_at = raw.get("updated_at")

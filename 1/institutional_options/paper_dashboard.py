@@ -86,6 +86,7 @@ PAGE = r"""<!DOCTYPE html>
     <div class="card"><div class="k">Net P&amp;L avg</div><div class="v" id="avgpnl">—</div></div>
   </div>
   <div id="err" class="err"></div>
+  <div id="schedule" class="note"></div>
 
   <h2>Open Position</h2>
   <div id="open">no open position</div>
@@ -111,8 +112,10 @@ const cls = (v) => (v > 0 ? 'pos' : (v < 0 ? 'neg' : ''));
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 
 function render(st) {
-  $('sub').textContent = `started ${st.started_at} · session ${st.session_id} · last cycle ${st.last_cycle} · ${st.note}`;
-  $('mode').textContent = st.mode;
+  const lastCycle = st.last_cycle || 'not published yet';
+  const provenanceNote = st.note || 'No paper-runner provenance note published';
+  $('sub').textContent = `started ${st.started_at || '—'} · session ${st.session_id || '—'} · last cycle ${lastCycle} · ${provenanceNote}`;
+  $('mode').textContent = st.mode || 'UNKNOWN';
   $('market').textContent = st.market_open ? 'OPEN' : 'CLOSED';
   $('capital').textContent = '₹' + fmt(st.capital, 0);
   $('pnl').textContent = '₹' + fmt(st.realized_pnl, 0);
@@ -122,7 +125,29 @@ function render(st) {
   $('trades').textContent = trades.length;
   $('winrate').textContent = trades.length ? (100*wins/trades.length).toFixed(0) + '%' : '—';
   $('avgpnl').textContent = trades.length ? '₹' + fmt(trades.reduce((a,t)=>a+t.net_pnl,0)/trades.length, 0) : '—';
-  $('err').textContent = st.last_cycle_ok ? '' : ('Last cycle error: ' + (st.last_error || 'unknown'));
+  const cycleError = st.cycle_in_progress
+    ? 'Live Fyers cycle in progress; awaiting the next completed snapshot.'
+    : (st.last_error || st.error || st.preview_error || (
+      st.market_open === false && !st.last_cycle
+        ? 'No live paper cycle is available yet; the market is closed or the runner is still initializing.'
+        : 'The paper runner did not publish an error detail for the last cycle.'
+    ));
+  const errEl = $('err');
+  if (st.last_cycle_ok) {
+    errEl.textContent = '';
+    errEl.style.display = 'none';
+  } else {
+    errEl.textContent = 'Paper-cycle status: ' + cycleError;
+    errEl.style.display = 'block';
+  }
+  const schedule = (st.underlyings && st.underlyings._paper_schedule) || {};
+  const deferred = Array.isArray(schedule.deferred) ? schedule.deferred.length : 0;
+  const selected = Array.isArray(schedule.selected) ? schedule.selected.length : 0;
+  const audits = Array.isArray(schedule.audit_lane) ? schedule.audit_lane.length : 0;
+  const opportunities = Array.isArray(schedule.opportunity_lane) ? schedule.opportunity_lane.length : 0;
+  $('schedule').textContent = schedule.mode
+    ? `Scheduler: ${schedule.mode} · selected ${selected} · opportunity ${opportunities} · audit ${audits} · deferred ${deferred} · max audit age ${schedule.max_full_audit_cycles ?? '—'} cycles`
+    : 'Scheduler metadata not published yet';
   const ov = $('override');
   if (st.paper_overrides_active) {
     ov.style.display = 'block';
@@ -140,12 +165,13 @@ function render(st) {
 function renderOpen(p) {
   const el = $('open');
   if (!p) { el.textContent = 'no open position'; return; }
-  const u = p.last - p.entry;
+  const uPoints = p.unrealized_points ?? ((p.last != null && p.entry != null) ? p.last - p.entry : null);
+  const uPnl = p.unrealized_pnl ?? uPoints;
   const pol = p.exit_policy || {};
   const bits = [
-    `${p.side} ${fmt(p.strike,0)} @ ${fmt(p.entry)}`,
+    `${esc(p.side || '—')} ${fmt(p.strike,0)} @ ${fmt(p.entry)}`,
     `last ${fmt(p.last)}`,
-    `uPnL <span class="${cls(u)}">₹${fmt(u * (p.entry?0:0) || p.unrealized_pnl, 0)}</span> (${fmt(p.unrealized_points,1)} pts)`,
+    `uPnL <span class="${cls(uPnl)}">₹${fmt(uPnl, 0)}</span> (${fmt(uPoints,1)} pts)`,
     `stop ${fmt(p.stop_points,1)} pts · target ${fmt(p.target_points,1)} pts`,
     `elapsed ${p.elapsed_sec}s / ${p.max_duration_sec}s`,
     `MFE ${fmt(p.mfe_points,1)} · MAE ${fmt(p.mae_points,1)} · bars ${p.bars}`,
@@ -160,9 +186,10 @@ function renderCands(rows) {
   const head = ['underlying','side','strike','expiry','grade','score','threshold','eligible','decision','CQ','elas','conv','exec','conf','regime','dir','bid/ask','reasons'];
   let h = '<table><tr>' + head.map(c=>`<th>${c}</th>`).join('') + '</tr>';
   for (const r of rows) {
-    const gradeCls = 'b-' + r.grade.replace('+','').trim();
+    const grade = String(r.grade ?? '—');
+    const gradeCls = 'b-' + grade.replace('+','').trim();
     h += `<tr><td>${esc(r.underlying)}</td><td>${esc(r.side)}</td><td>${fmt(r.strike,0)}</td><td>${esc(r.expiry)}</td>` +
-      `<td><span class="badge ${gradeCls}">${esc(r.grade)}</span></td>` +
+      `<td><span class="badge ${gradeCls}">${esc(grade)}</span></td>` +
       `<td>${fmt(r.score,1)}</td><td>${fmt(r.threshold,1)}</td><td>${r.eligible?'✓':'✗'}</td><td>${esc(r.decision)}</td>` +
       `<td>${fmt(r.contract_quality,1)}</td><td>${fmt(r.premium_elasticity,2)}</td><td>${fmt(r.convexity,1)}</td>` +
       `<td>${fmt(r.execution,1)}</td><td>${fmt(r.confidence,1)}</td><td>${fmt(r.regime_fit,1)}</td><td>${fmt(r.direction,1)}</td>` +
@@ -190,7 +217,9 @@ function renderChains(uds) {
       rows += `<div class="strike-row"><span>${fmt(s.strike,0)} ${marker}</span><span>${ce}</span><span></span><span>${pe}</span><span></span></div>`;
     }
     const dh = d.depth_health || {};
-    const depth = `depth ${esc(dh.status || '—')} ${dh.successful_legs ?? 0}/${dh.requested_legs ?? 0} · 5L ${dh.five_level_legs ?? 0} · 429 ${dh.rate_limit_errors ?? 0}`;
+    const failures = Array.isArray(dh.failure_reasons) ? dh.failure_reasons.slice(0, 2).join('; ') : (dh.last_error || '');
+    const depthReason = failures ? ` · reason ${esc(failures)}` : '';
+    const depth = `depth ${esc(dh.status || '—')} ${dh.successful_legs ?? 0}/${dh.requested_legs ?? 0} · 5L ${dh.five_level_legs ?? 0} · 429 ${dh.rate_limit_errors ?? 0}${depthReason}`;
     const meta = `VIX ${d.vix!=null?fmt(d.vix,1):'—'} · exp ${esc(d.expiry)} · dte ${fmt(d.dte,1)} · dir ${fmt(d.direction,0)} · TQ ${fmt(d.trade_quality,0)} · host ${fmt(d.hostility,0)} · reqMove ${fmt(d.required_move,0)} · ATR1 ${fmt(d.atr1,2)} · eff ${fmt(d.trend_eff,0)} · ${depth}`;
     el.innerHTML += `<div class="chain-panel"><h3>${esc(und)}</h3><div class="muted" style="font-size:11px;margin-bottom:6px">${meta}</div>${rows}</div>`;
   }
@@ -223,12 +252,24 @@ function renderClosed(trades) {
   el.innerHTML = h + '</table>';
 }
 
+let tickInFlight = false;
 async function tick() {
+  if (tickInFlight) return;
+  tickInFlight = true;
   try {
-    const r = await fetch('state.json');
-    render(await r.json());
+    const r = await fetch('state.json', {cache:'no-store'});
+    const payload = await r.json();
+    if (!r.ok) {
+      render({...payload, last_cycle_ok:false});
+      return;
+    }
+    render(payload);
   } catch (e) {
-    $('err').textContent = 'state fetch failed: ' + e;
+    const errEl = $('err');
+    errEl.textContent = 'state fetch failed: ' + e;
+    errEl.style.display = 'block';
+  } finally {
+    tickInFlight = false;
   }
 }
 tick();
@@ -243,9 +284,25 @@ class DashboardHandler(BaseHTTPRequestHandler):
     snapshot_fn: Callable[[], dict] = lambda: {}
 
     def do_GET(self):  # noqa: N802 (stdlib naming)
-        if self.path.startswith("/state.json"):
-            body = json.dumps(_json_safe(self.snapshot_fn())).encode("utf-8")
-            self.send_response(200)
+        path = self.path.split("?", 1)[0]
+        if path == "/state.json":
+            try:
+                payload = _json_safe(self.snapshot_fn())
+                body = json.dumps(payload, allow_nan=False).encode("utf-8")
+                status = 200
+            except Exception as exc:
+                body = json.dumps({"error": "snapshot_unavailable", "detail": str(exc), "preview_only": True, "live_execution": "DISABLED"}).encode("utf-8")
+                status = 503
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if path not in {"/", "/index.html"}:
+            body = json.dumps({"error": "not_found", "preview_only": True, "live_execution": "DISABLED"}).encode("utf-8")
+            self.send_response(404)
             self.send_header("Content-Type", "application/json")
             self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Length", str(len(body)))
@@ -273,7 +330,7 @@ class PaperDashboard:
         self._thread: Optional[threading.Thread] = None
 
     def start(self) -> str:
-        handler = type("Handler", (DashboardHandler,), {"snapshot_fn": self.snapshot_fn})
+        handler = type("Handler", (DashboardHandler,), {"snapshot_fn": staticmethod(self.snapshot_fn)})
         self._server = ThreadingHTTPServer((self.host, self.port), handler)
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()

@@ -113,6 +113,7 @@ class RunnerState:
     last_cycle: str = ""
     last_cycle_ok: bool = False
     last_error: str = ""
+    cycle_in_progress: bool = False
     market_open: bool = False
     open_position: Optional[OpenPosition] = None
     closed_trades: list[ClosedTradeRecord] = field(default_factory=list)
@@ -209,6 +210,15 @@ class PaperRunner:
         self._monitor_cursor = 0
         self._last_monitor_refresh = float("-inf")
         self._last_monitor_batch: list[str] = []
+        # Staged paper-selector scheduler. This controls request priority and
+        # retry timing only; it never changes the frozen 59-instrument universe
+        # or bypasses any candidate, liquidity, risk, or execution gate.
+        self.staged_scheduler_enabled = bool(monitoring_cfg.get("staged_evaluation_enabled", True)) if isinstance(monitoring_cfg, Mapping) else True
+        self.scheduler_max_audit_cycles = max(1, int(monitoring_cfg.get("max_full_audit_cycles", 7))) if isinstance(monitoring_cfg, Mapping) else 7
+        self.scheduler_backoff_base_seconds = max(5.0, float(monitoring_cfg.get("failure_backoff_base_seconds", 30.0))) if isinstance(monitoring_cfg, Mapping) else 30.0
+        self.scheduler_backoff_max_seconds = max(self.scheduler_backoff_base_seconds, float(monitoring_cfg.get("failure_backoff_max_seconds", 180.0))) if isinstance(monitoring_cfg, Mapping) else 180.0
+        self._scheduler_cycle = 0
+        self._scheduler_meta: dict[str, dict[str, Any]] = {}
         self._risk_context = self._load_risk_context()
         self._playbook_codes_by_underlying: dict[str, frozenset[str]] = {}
         self._playbook_grades_by_underlying: dict[str, str] = {}
@@ -404,23 +414,163 @@ class PaperRunner:
         return [und for und, meta in self.universe.items()
                 if bool(meta.get("trade_enabled", not meta.get("monitor_only", False)))]
 
-    def _cycle_underlyings(self) -> list[str]:
-        """Fetch core paper names plus a rotating expanded research batch.
+    def _scheduler_entry(self, underlying: str) -> dict[str, Any]:
+        return self._scheduler_meta.setdefault(str(underlying), {
+            "status": "UNSEEN",
+            "failures": 0,
+            "last_attempt_cycle": -1,
+            "last_full_audit_cycle": -1,
+            "last_success_cycle": -1,
+            "next_retry_at": 0.0,
+            "last_error": "",
+            "last_deferred_reason": "",
+            "last_deferred_event_cycle": -1,
+        })
 
-        The four original indices remain present on every cycle. The 55 added
-        indices/stocks are paper-eligible and rotate through the main selector
-        in bounded batches, so all 59 can trade on paper without overwhelming
-        the quote endpoint. Any explicitly custom monitor-only names remain in
-        the rotating fetch lane for diagnostics/shadow research only.
+    def _scheduler_public_state(self, underlying: str) -> dict[str, Any]:
+        row = self._scheduler_entry(underlying)
+        return {
+            "lane": str(row.get("lane", "AUDIT")),
+            "status": str(row.get("status", "UNSEEN")),
+            "failures": int(row.get("failures", 0)),
+            "last_attempt_cycle": int(row.get("last_attempt_cycle", -1)),
+            "last_full_audit_cycle": int(row.get("last_full_audit_cycle", -1)),
+            "last_success_cycle": int(row.get("last_success_cycle", -1)),
+            "next_retry_at": float(row.get("next_retry_at", 0.0) or 0.0),
+            "last_error": str(row.get("last_error", "")),
+            "last_deferred_reason": str(row.get("last_deferred_reason", "")),
+        }
+
+    def _scheduler_mark_success(self, underlying: str) -> None:
+        row = self._scheduler_entry(underlying)
+        row.update({
+            "status": "SUCCESS",
+            "failures": 0,
+            "last_success_cycle": self._scheduler_cycle,
+            "last_full_audit_cycle": self._scheduler_cycle,
+            "next_retry_at": 0.0,
+            "last_error": "",
+        })
+        self.state.underlyings.setdefault(underlying, {})["scheduler"] = self._scheduler_public_state(underlying)
+
+    def _scheduler_mark_deferred(self, underlying: str, reason: str, details: Optional[Mapping[str, Any]] = None) -> None:
+        row = self._scheduler_entry(underlying)
+        row.update({
+            "status": "DEFERRED_STRUCTURAL",
+            "last_attempt_cycle": self._scheduler_cycle,
+            "last_deferred_reason": str(reason),
+            "last_error": "",
+            "next_retry_at": time.time() + self.monitor_poll_seconds,
+        })
+        self.state.underlyings.setdefault(underlying, {})["scheduler"] = self._scheduler_public_state(underlying)
+        self.state.underlyings.setdefault(underlying, {})["prefilter"] = {
+            "status": "DEFERRED",
+            "reason": str(reason),
+            "details": dict(details or {}),
+            "lane": str(row.get("lane", "OPPORTUNITY")),
+            "audit_due_by_cycle": self._scheduler_cycle + self.scheduler_max_audit_cycles,
+            "timestamp": now_ist().isoformat(),
+        }
+        self.event_ledger.append(
+            "PAPER_INSTRUMENT_DEFERRED", session_id=self.state.session_id,
+            underlying=underlying, exchange=self.universe.get(underlying, {}).get("exchange", "NSE"),
+            instrument_kind=self.universe.get(underlying, {}).get("instrument_kind", "INDEX"),
+            instrument_class=class_for_metadata(self.universe.get(underlying, {}).get("exchange", "NSE"), self.universe.get(underlying, {}).get("instrument_kind", "INDEX")),
+            decision_source="structural_prefilter", ts=now_ist(),
+            payload={"reason": str(reason), "details": dict(details or {}), "scheduler_cycle": self._scheduler_cycle},
+        )
+
+    def _scheduler_mark_failure(self, underlying: str, detail: str) -> None:
+        row = self._scheduler_entry(underlying)
+        failures = int(row.get("failures", 0)) + 1
+        delay = min(self.scheduler_backoff_max_seconds,
+                    self.scheduler_backoff_base_seconds * (2 ** min(failures - 1, 3)))
+        row.update({
+            "status": "FAILED_BACKOFF",
+            "failures": failures,
+            "last_full_audit_cycle": self._scheduler_cycle,
+            "next_retry_at": time.time() + delay,
+            "last_error": str(detail)[:240],
+        })
+        self.state.underlyings.setdefault(underlying, {})["scheduler"] = self._scheduler_public_state(underlying)
+
+    def _structural_prefilter(self, underlying: str, chain: OptionChainSnapshot, now: datetime) -> tuple[bool, str, dict[str, Any]]:
+        """Cheap quote admissibility check used only to budget depth requests.
+
+        This is not a trading gate. Core and audit-lane instruments always
+        receive depth. Opportunity-lane instruments may defer depth when every
+        nearest strike is clearly unusable, while the full candidate path still
+        records the defer reason and the next audit is guaranteed.
+        """
+        cfg = self.cfg.get("monitoring", {})
+        max_spread = float(cfg.get("structural_prefilter_max_spread_pct", 8.0)) if isinstance(cfg, Mapping) else 8.0
+        legs = []
+        nearest = chain.nearest_strike()
+        for strike in sorted(chain.strikes, key=lambda item: abs(item.strike - nearest))[:3]:
+            for leg in (strike.ce, strike.pe):
+                if leg is not None:
+                    legs.append(leg)
+        if not legs:
+            return False, "STRUCTURAL_NO_NEAREST_OPTION_LEGS", {"legs": 0}
+        fresh_valid = 0
+        acceptable = 0
+        for leg in legs:
+            quote = leg.quote
+            if quote.bid <= 0 or quote.ask <= quote.bid or quote.mid <= 0:
+                continue
+            try:
+                age = max(0.0, (now - quote.timestamp).total_seconds())
+            except Exception:
+                age = 999.0
+            if age > 8.0:
+                continue
+            fresh_valid += 1
+            spread_pct = quote.spread / quote.mid * 100.0
+            if spread_pct <= max_spread:
+                acceptable += 1
+        details = {"legs": len(legs), "fresh_valid": fresh_valid, "acceptable_spread": acceptable, "max_spread_pct": max_spread}
+        if fresh_valid == 0:
+            return False, "STRUCTURAL_NO_FRESH_VALID_QUOTES", details
+        if acceptable == 0:
+            return False, "STRUCTURAL_ALL_SPREADS_TOO_WIDE", details
+        return True, "STRUCTURAL_QUOTES_ADMISSIBLE", details
+
+    def _scheduler_priority(self, underlying: str, now: float) -> tuple[float, str]:
+        row = self._scheduler_entry(underlying)
+        score = 0.0
+        if int(row.get("last_full_audit_cycle", -1)) < 0:
+            score += 100.0
+        if int(row.get("last_success_cycle", -1)) >= 0:
+            age = max(0, self._scheduler_cycle - int(row.get("last_success_cycle", -1)))
+            score += min(50.0, float(age) * 5.0)
+        if str(row.get("status")) == "SUCCESS":
+            score += 10.0
+        if int(row.get("failures", 0)):
+            score -= min(25.0, float(row.get("failures", 0)) * 5.0)
+        if now >= float(row.get("next_retry_at", 0.0) or 0.0):
+            score += 15.0
+        return score, underlying
+
+    def _cycle_underlyings(self) -> list[str]:
+        """Return core names plus a priority-ordered expanded paper batch.
+
+        Every configured trade-enabled instrument remains in the 59-instrument
+        paper universe. This scheduler only controls request order and bounded
+        retry timing. Core indices are always refreshed. Expanded instruments
+        with repeated structural failures enter a bounded backoff, but each is
+        forced through a full audit before ``max_full_audit_cycles`` expires.
         """
         all_trade = self._trade_underlyings()
         rotation_cfg = self.cfg.get("monitoring", {})
         rotation_enabled = bool(rotation_cfg.get("paper_trade_rotation_enabled", True)) if isinstance(rotation_cfg, Mapping) else True
-        if not rotation_enabled:
+        self._scheduler_cycle += 1
+        if not rotation_enabled or not self.staged_scheduler_enabled:
             self.state.underlyings["_paper_schedule"] = {
-                "mode": "ALL_CONFIGURED_UNDERLYINGS",
+                "mode": "ALL_CONFIGURED_UNDERLYINGS" if not rotation_enabled else "CORE_PLUS_ROTATING_EXPANDED",
                 "selected": all_trade,
+                "deferred": [],
                 "total_paper_underlyings": len(all_trade),
+                "scheduler_cycle": self._scheduler_cycle,
             }
             return all_trade
         core = [und for und in ("NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY") if und in all_trade]
@@ -431,33 +581,83 @@ class PaperRunner:
             return all_trade
         batch_size = max(1, int(rotation_cfg.get("paper_trade_batch_size", self.monitor_batch_size))) if isinstance(rotation_cfg, Mapping) else self.monitor_batch_size
         now_mono = time.monotonic()
-        refresh_due = (not self._last_monitor_batch
-                       or now_mono - self._last_monitor_refresh >= self.monitor_poll_seconds)
-        if not refresh_due:
+        if self._last_monitor_batch and now_mono - self._last_monitor_refresh < self.monitor_poll_seconds:
+            selected = core + self._last_monitor_batch
             self.state.underlyings["_paper_schedule"] = {
-                "mode": "CORE_PLUS_ROTATING_EXPANDED",
+                "mode": "CORE_PLUS_PRIORITY_LANES",
                 "batch_size": batch_size,
                 "total_paper_underlyings": len(all_trade),
-                "selected": core + self._last_monitor_batch,
-                "last_batch": self._last_monitor_batch,
-                "next_cursor": self._monitor_cursor,
+                "selected": selected,
+                "core": core,
+                "last_batch": list(self._last_monitor_batch),
+                "deferred": [],
+                "scheduler_cycle": self._scheduler_cycle,
                 "next_refresh_in_sec": round(max(0.0, self.monitor_poll_seconds - (now_mono - self._last_monitor_refresh)), 1),
+                "max_full_audit_cycles": self.scheduler_max_audit_cycles,
             }
-            return core + self._last_monitor_batch
-        batch_size = min(batch_size, len(expanded))
-        start = self._monitor_cursor % len(expanded)
-        selected = [expanded[(start + i) % len(expanded)] for i in range(batch_size)]
-        self._monitor_cursor = (start + batch_size) % len(expanded)
+            return selected
+        now = time.time()
+        due: list[tuple[float, str, str]] = []
+        deferred: list[dict[str, Any]] = []
+        for und in expanded:
+            row = self._scheduler_entry(und)
+            retry_ready = now >= float(row.get("next_retry_at", 0.0) or 0.0)
+            audit_due = int(row.get("last_full_audit_cycle", -1)) < 0 or (
+                self._scheduler_cycle - int(row.get("last_full_audit_cycle", -1)) >= self.scheduler_max_audit_cycles
+            )
+            if retry_ready or audit_due:
+                priority, _ = self._scheduler_priority(und, now)
+                lane = "AUDIT" if audit_due else "OPPORTUNITY"
+                due.append((priority, und, lane))
+            else:
+                reason = "FAILURE_BACKOFF"
+                row["last_deferred_reason"] = reason
+                deferred.append({"underlying": und, "lane": "AUDIT", "reason": reason,
+                                 "retry_at": datetime.fromtimestamp(float(row.get("next_retry_at", 0.0)), timezone.utc).isoformat()})
+                if self._scheduler_cycle - int(row.get("last_deferred_event_cycle", -1)) >= self.scheduler_max_audit_cycles:
+                    row["last_deferred_event_cycle"] = self._scheduler_cycle
+                    self.event_ledger.append(
+                        "PAPER_INSTRUMENT_DEFERRED", session_id=self.state.session_id,
+                        underlying=und, exchange=self.universe.get(und, {}).get("exchange", "NSE"),
+                        instrument_kind=self.universe.get(und, {}).get("instrument_kind", "INDEX"),
+                        instrument_class=class_for_metadata(self.universe.get(und, {}).get("exchange", "NSE"), self.universe.get(und, {}).get("instrument_kind", "INDEX")),
+                        decision_source="staged_scheduler", ts=now_ist(),
+                        payload={"lane": "AUDIT", "reason": reason, "scheduler_cycle": self._scheduler_cycle},
+                    )
+        order = {und: index for index, und in enumerate(expanded)}
+        rotation_start = self._monitor_cursor % len(expanded)
+        due.sort(key=lambda item: (
+            -item[0],
+            (order[item[1]] - rotation_start) % len(expanded),
+            item[1],
+        ))
+        selected = [und for _, und, _ in due[:min(batch_size, len(due))]]
+        self._monitor_cursor = (rotation_start + min(batch_size, len(due))) % len(expanded)
+        for und in core:
+            self._scheduler_entry(und)["lane"] = "CORE"
+        for _, und, lane in due[:min(batch_size, len(due))]:
+            row = self._scheduler_entry(und)
+            row["lane"] = lane
+            row["last_attempt_cycle"] = self._scheduler_cycle
+            row["last_deferred_reason"] = ""
+        for _, und, lane in due[min(batch_size, len(due)):]:
+            self._scheduler_entry(und)["lane"] = lane
+        deferred.extend({"underlying": und, "lane": lane, "reason": "BATCH_LIMIT"}
+                        for _, und, lane in due[min(batch_size, len(due)):])
         self._last_monitor_batch = selected
         self._last_monitor_refresh = now_mono
         self.state.underlyings["_paper_schedule"] = {
-            "mode": "CORE_PLUS_ROTATING_EXPANDED",
+            "mode": "CORE_PLUS_PRIORITY_LANES",
             "batch_size": batch_size,
             "total_paper_underlyings": len(all_trade),
             "selected": core + selected,
-            "last_batch": selected,
-            "next_cursor": self._monitor_cursor,
-            "next_refresh_in_sec": self.monitor_poll_seconds,
+            "core": core,
+            "opportunity_lane": [und for _, und, lane in due if lane == "OPPORTUNITY"],
+            "audit_lane": [und for _, und, lane in due if lane == "AUDIT"],
+            "deferred": deferred,
+            "scheduler_cycle": self._scheduler_cycle,
+            "max_full_audit_cycles": self.scheduler_max_audit_cycles,
+            "failure_backoff_seconds": [self.scheduler_backoff_base_seconds, self.scheduler_backoff_max_seconds],
         }
         return core + selected
 
@@ -526,6 +726,7 @@ class PaperRunner:
                     self.run_one_cycle()
                 except Exception as e:  # keep the loop alive, but block new entries during stabilization
                     self.state.last_cycle_ok = False
+                    self.state.cycle_in_progress = False
                     self.state.last_error = f"{type(e).__name__}: {e}"
                     self._incident_reason = f"Cycle failure: {self.state.last_error}"
                     stable_wait = float(self.config.section("data_health").get("reconnect_stable_wait_sec", 30.0))
@@ -543,6 +744,10 @@ class PaperRunner:
 
     def run_one_cycle(self) -> None:
         now = now_ist()
+        # Clear only the global cycle-failure field. Instrument-level warnings
+        # remain in each underlying's chain/depth health and evidence records.
+        self.state.last_error = ""
+        self.state.cycle_in_progress = True
         self._roll_daily_risk_state(now)
         self._risk_context = self._load_risk_context()
         self._refresh_daily_controls(now)
@@ -551,6 +756,7 @@ class PaperRunner:
             if self.state.open_position is not None and now.weekday() < 5 and now.hour * 60 + now.minute > 15 * 60 + 30:
                 self._force_close_end_of_day(now)
             self.state.last_cycle = now.isoformat()
+            self.state.cycle_in_progress = False
             return
         chains: dict[str, OptionChainSnapshot] = {}
         vix_map: dict[str, Optional[float]] = {}
@@ -563,24 +769,40 @@ class PaperRunner:
             meta = self.universe[und]
             try:
                 payload = self.client.option_chain(meta["index_symbol"], self.strikecount)
+                payloads[und] = payload
                 cal = parse_expiry_calendar(payload)
                 expiry = self._select_expiry(und, cal, bool(meta.get("prefer_monthly", False)))
                 chain = FyersOptionChainParser.parse(payload, und, expiry, now)
+                scheduler_lane = str(self._scheduler_entry(und).get("lane", "AUDIT"))
+                if self.staged_scheduler_enabled and scheduler_lane == "OPPORTUNITY":
+                    prefilter_ok, prefilter_reason, prefilter_details = self._structural_prefilter(und, chain, now)
+                    self.state.underlyings.setdefault(und, {})["prefilter"] = {
+                        "status": "ADMISSIBLE" if prefilter_ok else "DEFERRED",
+                        "reason": prefilter_reason,
+                        "details": prefilter_details,
+                        "lane": scheduler_lane,
+                        "timestamp": now.isoformat(),
+                    }
+                    if not prefilter_ok:
+                        self._scheduler_mark_deferred(und, prefilter_reason, prefilter_details)
+                        self._log(f"  {und} structural prefilter deferred: {prefilter_reason}")
+                        continue
                 chain = self._enrich_fyers_depth(und, chain, payload)
                 vix = parse_india_vix(payload)
                 chains[und] = chain
                 vix_map[und] = vix
                 history = self._fetch_history(und, meta["index_symbol"])
                 histories[und] = history
-                payloads[und] = payload
                 direction_inputs = self._direction_model_histories(und)
                 context_map[und] = self.signal.compute_context(
                     chain, vix, now, history_candles=history,
                     direction_model_inputs=direction_inputs,
                 )
+                self._scheduler_mark_success(und)
             except Exception as e:
                 detail = f"{type(e).__name__}: {e}"
                 reason_code = "OPTIONS_CHAIN_UNAVAILABLE" if "optionsChain" in str(e) else "OPTIONS_CHAIN_ERROR"
+                self._scheduler_mark_failure(und, detail)
                 self.state.underlyings[und] = {
                     "error": detail,
                     "chain_health": {
@@ -666,6 +888,7 @@ class PaperRunner:
 
         self.state.last_cycle = now_ist().isoformat()
         self.state.last_cycle_ok = True
+        self.state.cycle_in_progress = False
         self._update_equity()
 
     # -- candidate building + selection -----------------------------------------
@@ -1815,7 +2038,7 @@ class PaperRunner:
                 "trend_eff": round(ctx.trend_efficiency, 1),
                 "strikes": legs,
             }
-            for preserved_key in ("depth_health", "stale_data_alert", "instrument_error", "promotion"):
+            for preserved_key in ("depth_health", "stale_data_alert", "instrument_error", "promotion", "scheduler", "prefilter"):
                 if preserved_key in prior_state:
                     display_state[preserved_key] = prior_state[preserved_key]
             self.state.underlyings[und] = display_state
@@ -1906,6 +2129,7 @@ class PaperRunner:
             "last_cycle": self.state.last_cycle,
             "last_cycle_ok": self.state.last_cycle_ok,
             "last_error": self.state.last_error,
+            "cycle_in_progress": self.state.cycle_in_progress,
             "market_open": self.state.market_open,
             "mode": "PAPER (no orders placed)",
             "open_position": pos_view,

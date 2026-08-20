@@ -563,6 +563,11 @@
                        "monitor_poll_seconds":  60,
                        "paper_trade_rotation_enabled":  true,
                        "paper_trade_batch_size":  8,
+                       "staged_evaluation_enabled":  true,
+                       "max_full_audit_cycles":  7,
+                       "failure_backoff_base_seconds":  30,
+                       "failure_backoff_max_seconds":  180,
+                       "structural_prefilter_max_spread_pct":  8.0,
                        "rationale":  "Research-only collection is batched and refreshed once per minute so the expanded universe does not overwhelm the broker endpoint. Monitor-only instruments never enter ranking or paper entry until explicitly promoted.",
 
                        "constituent_source":  "https://nsearchives.nseindia.com/content/indices/ind_nifty50list.csv",

@@ -23,6 +23,19 @@ from institutional_options.models import DataHealth, Moneyness, OptionType
 
 
 CFG_PATH = "uploads/PARAMETERS.json"
+
+
+class TokenStoreTests(unittest.TestCase):
+    def test_load_accepts_utf8_bom_token_file(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "tokens.json"
+            path.write_text(json.dumps({"access_token": "access", "refresh_token": "refresh"}), encoding="utf-8-sig")
+            store = TokenStore(path)
+            store.load()
+            self.assertEqual(store.access_token, "access")
+            self.assertEqual(store.refresh_token, "refresh")
+
+
 RUNNER_CFG = {
     "poll_seconds": 1,
     "strikecount": 12,
@@ -381,6 +394,15 @@ class RunnerCycleTests(unittest.TestCase):
         self._clock.stop()
         self.tmp.cleanup()
 
+    def test_successful_cycle_clears_stale_global_error(self):
+        runner = PaperRunner(self.cfg, RUNNER_CFG, state_dir=self.state_dir,
+                             client=FakeClient(history=history_rising()),
+                             master=make_master())
+        runner.state.last_error = "OptionChainParseError: stale prior cycle"
+        runner.run_one_cycle()
+        self.assertEqual(runner.state.last_error, "")
+        self.assertTrue(runner.state.last_cycle_ok)
+
     def test_persistent_stale_data_alert_transitions_and_recovers(self):
         runner = PaperRunner(self.cfg, RUNNER_CFG, state_dir=self.state_dir,
                              client=FakeClient(history=history_rising()),
@@ -425,6 +447,37 @@ class RunnerCycleTests(unittest.TestCase):
         self.assertTrue(all(meta.get("trade_enabled") and not meta.get("monitor_only") for meta in underlyings.values()))
         self.assertEqual(cfg["monitoring"]["monitor_batch_size"], 8)
         self.assertEqual(cfg["monitoring"]["monitor_poll_seconds"], 60)
+
+    def test_priority_scheduler_keeps_core_and_full_audit_metadata(self):
+        full_cfg = json.loads(Path("uploads/PAPER_RUNNER.json").read_text(encoding="utf-8"))
+        full_cfg["monitoring"] = {**full_cfg.get("monitoring", {}), "monitor_poll_seconds": 0, "paper_trade_batch_size": 8}
+        runner = PaperRunner(self.cfg, full_cfg, state_dir=self.state_dir,
+                             client=FakeClient(), master=make_master())
+        selected = runner._cycle_underlyings()
+        schedule = runner.state.underlyings["_paper_schedule"]
+        self.assertEqual(len(runner._trade_underlyings()), 59)
+        self.assertEqual(set(selected[:4]), {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"})
+        self.assertEqual(len(selected), 12)
+        self.assertEqual(schedule["mode"], "CORE_PLUS_PRIORITY_LANES")
+        self.assertGreaterEqual(len(schedule["audit_lane"]), 8)
+        self.assertEqual(schedule["total_paper_underlyings"], 59)
+
+    def test_priority_scheduler_defers_backoff_but_preserves_audit_deadline(self):
+        full_cfg = json.loads(Path("uploads/PAPER_RUNNER.json").read_text(encoding="utf-8"))
+        full_cfg["monitoring"] = {**full_cfg.get("monitoring", {}), "monitor_poll_seconds": 0, "paper_trade_batch_size": 8}
+        runner = PaperRunner(self.cfg, full_cfg, state_dir=self.state_dir,
+                             client=FakeClient(), master=make_master())
+        first = runner._cycle_underlyings()
+        expanded = [u for u in runner._trade_underlyings() if u not in {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"}]
+        deferred_underlying = expanded[0]
+        row = runner._scheduler_entry(deferred_underlying)
+        row.update({"last_full_audit_cycle": runner._scheduler_cycle, "next_retry_at": time.time() + 3600, "status": "FAILED_BACKOFF"})
+        second = runner._cycle_underlyings()
+        schedule = runner.state.underlyings["_paper_schedule"]
+        self.assertNotIn(deferred_underlying, second)
+        self.assertTrue(any(item["underlying"] == deferred_underlying and item["reason"] == "FAILURE_BACKOFF" for item in schedule["deferred"]))
+        self.assertLessEqual(runner._scheduler_cycle - int(row["last_full_audit_cycle"]), runner.scheduler_max_audit_cycles)
+        self.assertEqual(len(first), 12)
 
     def test_prefer_monthly_selects_monthly_expiry(self):
         runner = PaperRunner(self.cfg, RUNNER_CFG, state_dir=self.state_dir,
