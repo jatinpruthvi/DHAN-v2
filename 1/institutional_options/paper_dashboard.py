@@ -125,8 +125,15 @@ function render(st) {
   $('trades').textContent = trades.length;
   $('winrate').textContent = trades.length ? (100*wins/trades.length).toFixed(0) + '%' : '—';
   $('avgpnl').textContent = trades.length ? '₹' + fmt(trades.reduce((a,t)=>a+t.net_pnl,0)/trades.length, 0) : '—';
+  const cycleStartedMs = st.cycle_started_at ? Date.parse(st.cycle_started_at) : NaN;
+  const cycleAgeSeconds = Number.isFinite(cycleStartedMs)
+    ? Math.max(0, Math.floor((Date.now() - cycleStartedMs) / 1000))
+    : null;
+  const cycleAgeText = cycleAgeSeconds == null
+    ? 'elapsed time unavailable'
+    : `${Math.floor(cycleAgeSeconds / 60)}m ${cycleAgeSeconds % 60}s elapsed`;
   const cycleError = st.cycle_in_progress
-    ? 'Live Fyers cycle in progress; awaiting the next completed snapshot.'
+    ? `Live Fyers cycle in progress (${cycleAgeText}); awaiting the next completed snapshot.`
     : (st.last_error || st.error || st.preview_error || (
       st.market_open === false && !st.last_cycle
         ? 'No live paper cycle is available yet; the market is closed or the runner is still initializing.'

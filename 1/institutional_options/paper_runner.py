@@ -114,6 +114,7 @@ class RunnerState:
     last_cycle_ok: bool = False
     last_error: str = ""
     cycle_in_progress: bool = False
+    cycle_started_at: str = ""
     market_open: bool = False
     open_position: Optional[OpenPosition] = None
     closed_trades: list[ClosedTradeRecord] = field(default_factory=list)
@@ -166,7 +167,14 @@ class PaperRunner:
             raise ValueError("replay mode requires an injected replay client")
         else:
             creds = FyersCredentials.from_env()
-            self.client = FyersRestClient(creds, TokenStore(self.state_dir / "tokens.json"))
+            timeout_cfg = self.cfg.get("fyers_request_timeout_seconds", 15)
+            try:
+                request_timeout = max(5, min(30, int(timeout_cfg)))
+            except (TypeError, ValueError):
+                request_timeout = 15
+            self.client = FyersRestClient(
+                creds, TokenStore(self.state_dir / "tokens.json"), timeout=request_timeout,
+            )
             self.client.ensure_session()
 
         self.signal = PaperSignalCalculator(self.config)
@@ -748,6 +756,7 @@ class PaperRunner:
         # remain in each underlying's chain/depth health and evidence records.
         self.state.last_error = ""
         self.state.cycle_in_progress = True
+        self.state.cycle_started_at = now.isoformat()
         self._roll_daily_risk_state(now)
         self._risk_context = self._load_risk_context()
         self._refresh_daily_controls(now)
@@ -2130,6 +2139,7 @@ class PaperRunner:
             "last_cycle_ok": self.state.last_cycle_ok,
             "last_error": self.state.last_error,
             "cycle_in_progress": self.state.cycle_in_progress,
+            "cycle_started_at": self.state.cycle_started_at,
             "market_open": self.state.market_open,
             "mode": "PAPER (no orders placed)",
             "open_position": pos_view,

@@ -228,6 +228,18 @@ class FyersDepthTests(unittest.TestCase):
             self.assertIn("symbol=NSE%3ANIFTY2681824200CE", url)
             self.assertIn("ohlcv_flag=1", url)
             self.assertEqual(req.call_args.kwargs["auth_header"], "APP-100:token")
+            self.assertEqual(req.call_args.kwargs["timeout"], 7)
+
+    def test_option_chain_uses_configured_request_timeout(self):
+        with tempfile.TemporaryDirectory() as td:
+            client = FyersRestClient(
+                FyersCredentials("APP-100", "secret"),
+                TokenStore(Path(td) / "tokens.json"),
+                timeout=11,
+            )
+            with mock.patch("institutional_options.fyers_client._req", return_value=(200, {"s": "ok"})) as req:
+                self.assertEqual(client.option_chain("NSE:NIFTY50-INDEX"), {"s": "ok"})
+            self.assertEqual(req.call_args.kwargs["timeout"], 11)
 
     def test_market_depth_retries_429_and_records_stats(self):
         with tempfile.TemporaryDirectory() as td:

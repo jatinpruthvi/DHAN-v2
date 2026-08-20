@@ -65,6 +65,8 @@ class PaperDashboardTests(unittest.TestCase):
     def test_page_contains_latest_safety_and_observability_guards(self):
         self.assertIn("No live paper cycle is available yet", PAGE)
         self.assertIn("Live Fyers cycle in progress", PAGE)
+        self.assertIn("cycle_started_at", PAGE)
+        self.assertIn("elapsed", PAGE)
         self.assertIn("const grade = String(r.grade ?? '—')", PAGE)
         self.assertIn("failure_reasons", PAGE)
         self.assertIn("cache:'no-store'", PAGE)

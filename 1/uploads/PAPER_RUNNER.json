@@ -1,6 +1,8 @@
 {
-    "poll_seconds":  5,
+        "poll_seconds":  5,
+    "fyers_request_timeout_seconds":  15,
     "strikecount":  30,
+
     "capture":  true,
     "dashboard":  {
                       "host":  "127.0.0.1",
